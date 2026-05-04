@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+*.tsbuildinfo
+
+# Environment (templates like .env.example stay tracked)
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# User uploads & local runtime data
+uploads/
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# Prisma (client is generated into node_modules; keep migrations tracked)
+
+# Local scratch / generated output
+scraper-output.txt
+
+# Cloud / service account key files (never commit real keys)
+ornate-unity*.json
+*credentials*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+!tsconfig.*.json
