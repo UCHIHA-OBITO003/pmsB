@@ -66,6 +66,17 @@ export const config = {
     sheetId: process.env.GOOGLE_SHEET_ID || '',
   },
 
+  /** Codemagen (Redmine JSON API) — HTTP Basic only; used by sheet-less sync, legacy ticket refresh, mass extraction */
+  codemagen: {
+    baseUrl: (process.env.CODEMAGEN_BASE_URL || 'https://pms.codemagen.net').replace(/\/$/, ''),
+    username: (
+      process.env.CODEMAGEN_USERNAME ||
+      process.env.REDMINE_USERNAME ||
+      ''
+    ).trim(),
+    password: (process.env.CODEMAGEN_PASSWORD || process.env.REDMINE_PASSWORD || '').trim(),
+  },
+
   upload: {
     dir: process.env.UPLOAD_DIR || './uploads',
     maxSizeMb: parseInt(process.env.MAX_FILE_SIZE_MB || '50'),

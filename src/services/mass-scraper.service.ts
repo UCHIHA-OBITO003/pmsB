@@ -4,6 +4,7 @@ import { resolveUserAlias, isHanzDeveloper } from '../utils/user-mapping';
 import bcrypt from 'bcryptjs';
 import { STATUS_MAP, PRIORITY_MAP } from '../utils/mappings';
 import { logger } from '../utils/logger';
+import { config } from '../utils/config';
 
 export class MassScraperService {
   private activeJobs: Map<string, boolean> = new Map();
@@ -57,17 +58,20 @@ export class MassScraperService {
   }
 
   private async processItem(jobId: string, id: number, projectId: string) {
-    const url = `https://pms.codemagen.net/issues/${id}`;
+    const url = `${config.codemagen.baseUrl}/issues/${id}`;
     
     try {
       const metadata = await redmineScraper.scrapeIssue(url);
-      const converted = metadata.converted;
+      const converted = metadata.converted as Record<string, string | undefined | null>;
 
-      const title = converted.title || `Legacy Issue #${id}`;
+      const title = (typeof converted.title === 'string' && converted.title) || `Legacy Issue #${id}`;
       const statusSlug = STATUS_MAP[converted.Status || ''] || 'todo';
       const priorityStr = PRIORITY_MAP[converted.Priority || ''] || 'MEDIUM';
-      const description = converted.description || null;
-      const type = converted.title?.toLowerCase().includes('story') || converted.parentTask?.toLowerCase().includes('story') ? 'STORY' : 'TASK';
+      const description = typeof converted.description === 'string' ? converted.description : null;
+      const titleLc = typeof converted.title === 'string' ? converted.title.toLowerCase() : '';
+      const parentLc = typeof converted.parentTask === 'string' ? converted.parentTask.toLowerCase() : '';
+      const type =
+        titleLc.includes('story') || parentLc.includes('story') ? 'STORY' : 'TASK';
 
       // Workflow state
       const workflowStates = await prisma.workflowState.findMany({ where: { projectId } });
@@ -78,7 +82,7 @@ export class MassScraperService {
       // Assignees
       const assigneeIds: string[] = [];
       if (converted.Assignee && converted.Assignee !== '-' && converted.Assignee !== 'N/A') {
-        const rawNames = converted.Assignee.split(/&|\||,|and/i).map((n: string) => n.trim()).filter(Boolean);
+        const rawNames = String(converted.Assignee).split(/&|\||,|and/i).map((n: string) => n.trim()).filter(Boolean);
         for (const rawName of rawNames) {
           const name = resolveUserAlias(rawName);
           let user = await prisma.user.findFirst({
