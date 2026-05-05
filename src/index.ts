@@ -7,6 +7,7 @@ import { startCrons } from './crons';
 import { startHttpKeepalive, stopHttpKeepalive } from './utils/httpKeepalive';
 import { startImportWorker, stopImportWorker } from './queues/workers/import.worker';
 import { startEmailWorker, stopEmailWorker } from './queues/workers/email.worker';
+import { startLegacySyncWorker, stopLegacySyncWorker } from './queues/workers/legacy-sync.worker';
 
 async function bootstrap() {
   try {
@@ -25,6 +26,7 @@ async function bootstrap() {
     // Mount BullMQ workers (import-job + email-job)
     startImportWorker();
     startEmailWorker();
+    startLegacySyncWorker();
 
     // Start server
     app.listen(config.port, () => {
@@ -43,7 +45,7 @@ async function shutdown() {
   logger.info('Shutdown signal received — draining workers…');
   stopHttpKeepalive();
   // Wait for in-flight jobs to finish before exiting
-  await Promise.all([stopImportWorker(), stopEmailWorker()]);
+  await Promise.all([stopImportWorker(), stopEmailWorker(), stopLegacySyncWorker()]);
   await prisma.$disconnect();
   redis.disconnect();
   process.exit(0);

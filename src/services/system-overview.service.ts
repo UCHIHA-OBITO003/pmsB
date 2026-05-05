@@ -139,7 +139,7 @@ export async function buildSystemOverview() {
           driver: 'BullMQ (Redis-backed)',
           workersActive: true,
           metrics: queueMetrics,
-          note: 'import-job: Google Sheet syncs + Excel file imports. email-job: outgoing SMTP mail. Completed/failed counts reset when the process restarts (removeOnComplete/removeOnFail limits apply).',
+          note: 'import-job: sheet + file imports. email-job: SMTP. legacy-sync-job: Codemagen re-scrape queue. Completed/failed counts reset on restart (removeOnComplete/removeOnFail limits apply).',
         }
       : {
           driver: 'BullMQ (Redis-backed)',

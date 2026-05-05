@@ -65,6 +65,20 @@ export const emailQueue = new Queue<EmailJobData>('email-job', {
   },
 });
 
+// ─── Legacy Codemagen re-sync queue ───────────────────────────────────────────
+
+export type LegacySyncJobData = { ticketId: string };
+
+export const legacySyncQueue = new Queue<LegacySyncJobData>('legacy-sync-job', {
+  connection: redis,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 20_000 },
+    removeOnComplete: { count: 200 },
+    removeOnFail: { count: 500 },
+  },
+});
+
 // ─── Convenience helpers ──────────────────────────────────────────────────────
 
 /** Enqueue a Google Sheet sync and return the created job. */
@@ -83,14 +97,24 @@ export async function enqueueEmail(data: EmailJobData) {
   return emailQueue.add('send-email', data);
 }
 
+/** Enqueue Codemagen legacy sync jobs for many ticket IDs (returns BullMQ job ids). */
+export async function enqueueLegacySyncJobs(ticketIds: string[]) {
+  const jobs = await Promise.all(
+    ticketIds.map((ticketId) => legacySyncQueue.add('codemagen-sync', { ticketId })),
+  );
+  return jobs.map((j) => j.id);
+}
+
 /** Snapshot of queue metrics for the system overview endpoint. */
 export async function getQueueMetrics() {
-  const [importCounts, emailCounts] = await Promise.all([
+  const [importCounts, emailCounts, legacyCounts] = await Promise.all([
     importQueue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed'),
     emailQueue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed'),
+    legacySyncQueue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed'),
   ]);
   return {
     'import-job': importCounts,
     'email-job': emailCounts,
+    'legacy-sync-job': legacyCounts,
   };
 }
