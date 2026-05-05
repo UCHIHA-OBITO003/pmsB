@@ -7,6 +7,7 @@ import { excelImportService, extractSheetId } from '../services/excel-import.ser
 import { AppError } from '../middleware/errorHandler';
 import { config } from '../utils/config';
 import { prisma } from '../utils/prisma';
+import { enqueueSheetSync, enqueueFileImport, importQueue } from '../queues/index';
 
 const router = Router();
 router.use(authenticate);
@@ -63,6 +64,7 @@ router.post('/sheet-configs', requirePermission('excel', 'create'), async (req: 
     }).default({}),
     intervalMins: z.number().min(5).max(1440).default(30),
     sheetName: z.string().optional(),
+    legacyTicketProjectId: z.string().uuid().nullable().optional(),
   });
 
   const data = schema.parse(req.body);
@@ -131,22 +133,40 @@ router.post('/sync', requirePermission('excel', 'create'), async (req: AuthReque
     projectId: z.string().uuid(),
     configId: z.string().optional(),
     columnMapping: z.record(z.string()).optional(),
+    legacyTicketProjectId: z.string().uuid().nullable().optional(),
   });
 
-  const { sheetUrl, sheetId: rawSheetId, projectId, configId, columnMapping } = schema.parse(req.body);
+  const { sheetUrl, sheetId: rawSheetId, projectId, configId, columnMapping, legacyTicketProjectId } =
+    schema.parse(req.body);
 
   const resolvedSheetId = rawSheetId || (sheetUrl ? extractSheetId(sheetUrl) : null);
   if (!resolvedSheetId) throw new AppError(400, 'Provide sheetUrl or sheetId', 'MISSING_PARAM');
 
-  const result = await excelImportService.syncGoogleSheet(
-    resolvedSheetId,
-    projectId,
-    req.user!.id,
-    columnMapping as any || undefined,
-    configId,
-  );
+  let resolvedLegacy = legacyTicketProjectId;
+  if (configId && resolvedLegacy === undefined) {
+    const cfg = await (prisma as any).sheetSyncConfig.findUnique({
+      where: { id: configId },
+      select: { legacyTicketProjectId: true },
+    });
+    resolvedLegacy = cfg?.legacyTicketProjectId ?? undefined;
+  }
 
-  res.json({ success: true, data: result });
+  const job = await enqueueSheetSync({
+    type: 'google-sheet',
+    sheetId: resolvedSheetId,
+    projectId,
+    userId: req.user!.id,
+    columnMapping: (columnMapping as Record<string, string>) || undefined,
+    configId,
+    legacyTicketProjectId: resolvedLegacy,
+  });
+
+  res.status(202).json({
+    success: true,
+    queued: true,
+    jobId: job.id,
+    message: 'Sheet sync enqueued. Poll GET /api/excel/jobs/:jobId for progress.',
+  });
 });
 
 /**
@@ -215,8 +235,49 @@ router.post('/upload', requirePermission('excel', 'create'), upload.single('file
  */
 router.post('/import', requirePermission('excel', 'create'), async (req: AuthRequest, res) => {
   const { filePath, projectId, columnMapping } = req.body;
-  const result = await excelImportService.importFile(filePath, projectId, columnMapping, req.user!.id);
-  res.json({ success: true, data: result });
+  const job = await enqueueFileImport({
+    type: 'excel-file',
+    filePath,
+    projectId,
+    userId: req.user!.id,
+    columnMapping,
+  });
+  res.status(202).json({
+    success: true,
+    queued: true,
+    jobId: job.id,
+    message: 'File import enqueued. Poll GET /api/excel/jobs/:jobId for progress.',
+  });
+});
+
+/**
+ * GET /api/excel/jobs/:jobId
+ * Poll the status of a queued import job.
+ */
+router.get('/jobs/:jobId', requirePermission('excel', 'read'), async (req, res) => {
+  const job = await importQueue.getJob(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ success: false, error: { message: 'Job not found' } });
+  }
+  const state = await job.getState();
+  const progress = job.progress;
+  const result = state === 'completed' ? job.returnvalue : undefined;
+  const failedReason = state === 'failed' ? job.failedReason : undefined;
+
+  res.json({
+    success: true,
+    data: {
+      jobId: job.id,
+      name: job.name,
+      state,
+      progress,
+      result,
+      failedReason,
+      attemptsMade: job.attemptsMade,
+      processedOn: job.processedOn,
+      finishedOn: job.finishedOn,
+    },
+  });
 });
 
 export default router;

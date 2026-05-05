@@ -12,7 +12,7 @@ const ProjectSchema = z.object({
   key: z.string().min(2).max(10).toUpperCase(),
   description: z.string().optional(),
   companyId: z.string().uuid().optional().nullable(),
-  teamId: z.string().uuid().optional(),
+  teamId: z.string().uuid().optional().nullable(),
   startDate: z.coerce.date().optional(),
   endDate: z.coerce.date().optional(),
   budget: z.number().optional(),
@@ -69,6 +69,47 @@ router.get('/:id', requirePermission('projects', 'read'), async (req, res) => {
 
   if (!project) throw new AppError(404, 'Project not found', 'NOT_FOUND');
   res.json({ success: true, data: project });
+});
+
+// GET /api/projects/:id/roster-summary — company, org, team, members, ticket counts by source
+router.get('/:id/roster-summary', requirePermission('projects', 'read'), async (req, res) => {
+  const project = await prisma.project.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+    include: {
+      company: { include: { organisation: { select: { id: true, name: true } } } },
+      team: {
+        select: {
+          id: true,
+          name: true,
+          members: { select: { userId: true, role: true } },
+        },
+      },
+      members: {
+        include: {
+          user: { select: { id: true, firstName: true, lastName: true, email: true, status: true } },
+        },
+      },
+    },
+  });
+  if (!project) throw new AppError(404, 'Project not found', 'NOT_FOUND');
+
+  const teamMemberIds = [...new Set(project.team?.members?.map((m) => m.userId) ?? [])];
+  const teamUsers =
+    teamMemberIds.length > 0 ?
+      await prisma.user.findMany({
+        where: { id: { in: teamMemberIds }, deletedAt: null },
+        select: { id: true, firstName: true, lastName: true, email: true, status: true },
+      })
+    : [];
+
+  const bySource = await prisma.ticket.groupBy({
+    by: ['source'],
+    where: { projectId: req.params.id, deletedAt: null },
+    _count: true,
+  });
+  const ticketCountBySource = Object.fromEntries(bySource.map((r) => [r.source, r._count]));
+
+  res.json({ success: true, data: { project, teamUsers, ticketCountBySource } });
 });
 
 // POST /api/projects

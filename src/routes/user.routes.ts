@@ -181,10 +181,22 @@ router.get('/me', async (req: AuthRequest, res) => {
 
 // GET /api/users
 router.get('/', requirePermission('users', 'read'), async (req, res) => {
-  const { search, department, status, page = '1', limit = '20' } = req.query as Record<string, string>;
+  const {
+    search,
+    department,
+    status,
+    page = '1',
+    limit = '20',
+    companyId,
+    organisationId,
+    projectId,
+    hideInactive,
+    showArchived,
+  } = req.query as Record<string, string>;
   const skip = (parseInt(page) - 1) * parseInt(limit);
 
-  const where: any = { deletedAt: null };
+  // showArchived=true → only tombstoned users; default → only active rows
+  const where: any = showArchived === 'true' ? { NOT: { deletedAt: null } } : { deletedAt: null };
   if (search) {
     where.OR = [
       { firstName: { contains: search, mode: 'insensitive' } },
@@ -193,7 +205,21 @@ router.get('/', requirePermission('users', 'read'), async (req, res) => {
     ];
   }
   if (department) where.department = department;
-  if (status) where.status = status;
+  if (hideInactive === 'true') {
+    where.status = 'ACTIVE';
+  } else if (status) {
+    where.status = status;
+  }
+
+  if (companyId) {
+    where.companyMembers = { some: { companyId } };
+  }
+  if (organisationId) {
+    where.organisationMembers = { some: { organisationId } };
+  }
+  if (projectId) {
+    where.projectMemberships = { some: { projectId } };
+  }
 
   const [users, total] = await prisma.$transaction([
     prisma.user.findMany({
@@ -289,7 +315,7 @@ router.post('/', requireRole('admin'), async (req: AuthRequest, res) => {
 });
 
 // POST /api/users/merge — admin merges duplicate accounts into one
-router.post('/merge', requireRole('admin'), async (req, res) => {
+router.post('/merge', requireRole('admin'), async (req: AuthRequest, res) => {
   const { targetUserId, sourceUserIds } = z
     .object({
       targetUserId: z.string().min(1),
@@ -297,7 +323,20 @@ router.post('/merge', requireRole('admin'), async (req, res) => {
     })
     .parse(req.body);
 
-  const result = await mergeUsersIntoTarget(targetUserId, sourceUserIds);
+  const result = await mergeUsersIntoTarget(targetUserId, sourceUserIds, req.user?.id);
+  res.json({ success: true, data: result });
+});
+
+// POST /api/users/admin/merge — alias (plan-aligned path)
+router.post('/admin/merge', requireRole('admin'), async (req: AuthRequest, res) => {
+  const { survivorId, mergeIds } = z
+    .object({
+      survivorId: z.string().min(1),
+      mergeIds: z.array(z.string().min(1)).min(1),
+    })
+    .parse(req.body);
+
+  const result = await mergeUsersIntoTarget(survivorId, mergeIds, req.user?.id);
   res.json({ success: true, data: result });
 });
 
@@ -445,13 +484,54 @@ router.patch('/:id', requirePermission('users', 'update'), async (req: AuthReque
   });
 });
 
-// DELETE /api/users/:id (soft delete)
-router.delete('/:id', requirePermission('users', 'delete'), async (req, res) => {
+// DELETE /api/users/:id (soft delete / tombstone)
+router.delete('/:id', requireRole('admin'), async (req: AuthRequest, res) => {
+  const u = await prisma.user.findFirst({ where: { id: req.params.id } });
+  if (!u) throw new AppError(404, 'User not found', 'NOT_FOUND');
+  if (u.id === req.user?.id) throw new AppError(400, 'Cannot deactivate yourself', 'BAD_REQUEST');
+
+  const tombEmail = u.email.includes('@pms.merge')
+    ? u.email
+    : `archived.${u.id.slice(0, 8)}.${Date.now()}@pms.merge`;
+
   await prisma.user.update({
-    where: { id: req.params.id },
-    data: { deletedAt: new Date(), status: 'INACTIVE' },
+    where: { id: u.id },
+    data: { deletedAt: new Date(), status: 'INACTIVE', email: tombEmail },
   });
-  res.json({ success: true, message: 'User deactivated' });
+  res.json({ success: true, message: 'User archived' });
+});
+
+// POST /api/users/repair-merge-tombstones — finds sources from merge audit logs that aren't tombstoned
+router.post('/repair-merge-tombstones', requireRole('admin'), async (_req, res) => {
+  const mergeLogs = await prisma.auditLog.findMany({
+    where: { action: 'user_merge' },
+    select: { metadata: true },
+  });
+
+  const allSourceIds: string[] = [];
+  for (const log of mergeLogs) {
+    const meta = log.metadata as { sourceIds?: string[]; sourcesDeactivated?: string[] } | null;
+    const ids = meta?.sourceIds ?? meta?.sourcesDeactivated ?? [];
+    allSourceIds.push(...ids);
+  }
+  const uniqueIds = [...new Set(allSourceIds)];
+
+  const notTombstoned = await prisma.user.findMany({
+    where: { id: { in: uniqueIds }, deletedAt: null },
+    select: { id: true, email: true },
+  });
+
+  let repaired = 0;
+  for (const u of notTombstoned) {
+    const tombEmail = `merged.${u.id.slice(0, 8)}.${Date.now()}@pms.merge`;
+    await prisma.user.update({
+      where: { id: u.id },
+      data: { deletedAt: new Date(), status: 'INACTIVE', email: tombEmail },
+    });
+    repaired++;
+  }
+
+  res.json({ success: true, data: { checked: uniqueIds.length, repaired, sources: notTombstoned.map(u => u.email) } });
 });
 
 // POST /api/users/:id/roles — assign role

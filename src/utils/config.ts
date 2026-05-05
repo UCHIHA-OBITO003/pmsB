@@ -94,4 +94,7 @@ export const config = {
     googleSheets: process.env.ENABLE_GOOGLE_SHEETS_SYNC === 'true',
     email: process.env.ENABLE_EMAIL_NOTIFICATIONS === 'true',
   },
+
+  /** Project `key` used when sheet rows reference Codemagen issues (e.g. EEP). */
+  legacyTicketProjectKey: (process.env.LEGACY_TICKET_PROJECT_KEY || 'EEP').trim(),
 };

@@ -5,6 +5,8 @@ import { prisma } from './utils/prisma';
 import { redis } from './utils/redis';
 import { startCrons } from './crons';
 import { startHttpKeepalive, stopHttpKeepalive } from './utils/httpKeepalive';
+import { startImportWorker, stopImportWorker } from './queues/workers/import.worker';
+import { startEmailWorker, stopEmailWorker } from './queues/workers/email.worker';
 
 async function bootstrap() {
   try {
@@ -20,6 +22,10 @@ async function bootstrap() {
     startCrons();
     logger.info('✅ Cron jobs started');
 
+    // Mount BullMQ workers (import-job + email-job)
+    startImportWorker();
+    startEmailWorker();
+
     // Start server
     app.listen(config.port, () => {
       logger.info(`🚀 Server running on http://localhost:${config.port}`);
@@ -33,13 +39,17 @@ async function bootstrap() {
   }
 }
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  logger.info('SIGTERM received, shutting down gracefully');
+async function shutdown() {
+  logger.info('Shutdown signal received — draining workers…');
   stopHttpKeepalive();
+  // Wait for in-flight jobs to finish before exiting
+  await Promise.all([stopImportWorker(), stopEmailWorker()]);
   await prisma.$disconnect();
   redis.disconnect();
   process.exit(0);
-});
+}
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
 
 bootstrap();

@@ -1,7 +1,6 @@
 import { prisma } from '../src/utils/prisma';
 import { redmineScraper } from '../src/services/redmine-scraper.service';
-import { resolveUserAlias, isHanzDeveloper } from '../src/utils/user-mapping';
-import bcrypt from 'bcryptjs';
+import { resolveOrCreateDeveloperFromAssignee } from '../src/utils/assignee-import-user';
 import { STATUS_MAP, PRIORITY_MAP } from '../src/utils/mappings';
 
 async function delay(ms: number) {
@@ -57,31 +56,8 @@ async function massImport() {
         const rawNames = converted.Assignee.split(/&|\||,|and/i).map((n: string) => n.trim()).filter(Boolean);
         
         for (const rawName of rawNames) {
-          const name = resolveUserAlias(rawName);
-          let user = await prisma.user.findFirst({
-            where: { firstName: { equals: name, mode: 'insensitive' }, deletedAt: null }
-          });
-
-          if (!user) {
-            const email = `${name.toLowerCase().replace(/[^a-z0-9]/g, '')}@pms.local`;
-            const hash = await bcrypt.hash('Dev@123456', 10);
-            const department = isHanzDeveloper(name) ? 'Hanz' : 'Codemagen';
-
-            user = await prisma.user.create({
-              data: {
-                firstName: name,
-                lastName: '',
-                email,
-                department,
-                password: hash,
-                roles: { create: { role: { connect: { name: 'DEVELOPER' } } } }
-              }
-            }).catch(async () => prisma.user.create({
-              data: { firstName: name, lastName: '', email: `${Date.now()}@pms.local`, password: hash, department }
-            }));
-            console.log(`  -> Auto-created user alias: ${name} (${department})`);
-          }
-          assigneeIds.push(user.id);
+          const user = await resolveOrCreateDeveloperFromAssignee(rawName);
+          if (user) assigneeIds.push(user.id);
         }
       }
 

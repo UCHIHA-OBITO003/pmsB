@@ -1,10 +1,10 @@
 import { prisma } from '../utils/prisma';
 import { redmineScraper } from './redmine-scraper.service';
-import { resolveUserAlias, isHanzDeveloper } from '../utils/user-mapping';
-import bcrypt from 'bcryptjs';
+import { resolveOrCreateDeveloperFromAssignee } from '../utils/assignee-import-user';
 import { STATUS_MAP, PRIORITY_MAP } from '../utils/mappings';
 import { logger } from '../utils/logger';
 import { config } from '../utils/config';
+import { parseLegacyTicketSource } from '../utils/legacy-source-url';
 
 export class MassScraperService {
   private activeJobs: Map<string, boolean> = new Map();
@@ -59,7 +59,9 @@ export class MassScraperService {
 
   private async processItem(jobId: string, id: number, projectId: string) {
     const url = `${config.codemagen.baseUrl}/issues/${id}`;
-    
+    const { legacySourceKey, canonicalUrl, issueNumber } = parseLegacyTicketSource(url);
+    const sourceUrl = canonicalUrl || url;
+
     try {
       const metadata = await redmineScraper.scrapeIssue(url);
       const converted = metadata.converted as Record<string, string | undefined | null>;
@@ -73,68 +75,65 @@ export class MassScraperService {
       const type =
         titleLc.includes('story') || parentLc.includes('story') ? 'STORY' : 'TASK';
 
-      // Workflow state
       const workflowStates = await prisma.workflowState.findMany({ where: { projectId } });
       const defaultState = workflowStates.find((s) => s.isDefault) || workflowStates[0];
       const stateBySlug = Object.fromEntries(workflowStates.map((s) => [s.slug, s]));
       const state = stateBySlug[statusSlug] || defaultState;
 
-      // Assignees
+      const projRow = await prisma.project.findUnique({
+        where: { id: projectId },
+        select: { companyId: true },
+      });
+
       const assigneeIds: string[] = [];
       if (converted.Assignee && converted.Assignee !== '-' && converted.Assignee !== 'N/A') {
         const rawNames = String(converted.Assignee).split(/&|\||,|and/i).map((n: string) => n.trim()).filter(Boolean);
         for (const rawName of rawNames) {
-          const name = resolveUserAlias(rawName);
-          let user = await prisma.user.findFirst({
-            where: { firstName: { equals: name, mode: 'insensitive' }, deletedAt: null }
-          });
-
-          if (!user) {
-            const email = `${name.toLowerCase().replace(/[^a-z0-9]/g, '')}@pms.local`;
-            const hash = await bcrypt.hash('Dev@123456', 10);
-            const department = isHanzDeveloper(name) ? 'Hanz' : 'Codemagen';
-            user = await prisma.user.create({
-              data: { firstName: name, lastName: '', email, department, password: hash }
-            });
-          }
-          assigneeIds.push(user.id);
+          const user = await resolveOrCreateDeveloperFromAssignee(rawName);
+          if (user) assigneeIds.push(user.id);
         }
       }
 
-      // Upsert
-      const existing = await prisma.ticket.findFirst({
-        where: { sourceUrl: url, deletedAt: null }
-      });
+      const existing =
+        legacySourceKey ?
+          await prisma.ticket.findFirst({ where: { legacySourceKey, deletedAt: null } })
+        : await prisma.ticket.findFirst({ where: { sourceUrl, deletedAt: null } });
+
+      const payloadCore: Record<string, unknown> = {
+        title,
+        description,
+        type: type as any,
+        priority: priorityStr as any,
+        metadata: metadata as any,
+        syncJobId: jobId,
+        sourceUrl,
+        projectId,
+      };
+      if (legacySourceKey) payloadCore.legacySourceKey = legacySourceKey;
+      if (issueNumber != null) payloadCore.legacyIssueNumber = issueNumber;
+      if (projRow?.companyId) payloadCore.companyId = projRow.companyId;
 
       if (existing) {
         await prisma.ticket.update({
           where: { id: existing.id },
           data: {
-            title,
-            description,
-            type: type as any,
-            priority: priorityStr as any,
+            ...payloadCore,
             workflowStateId: state?.id || existing.workflowStateId,
-            metadata: metadata as any,
-            syncJobId: jobId,
-            assignees: assigneeIds.length > 0 ? { set: assigneeIds.map(id => ({ id })) } : undefined
-          }
+            ...(assigneeIds.length > 0 ?
+              { assignees: { set: assigneeIds.map((uid) => ({ id: uid })) } }
+            : {}),
+          } as any,
         });
       } else {
         await prisma.ticket.create({
           data: {
-            projectId,
-            title,
-            description,
-            type: type as any,
-            priority: priorityStr as any,
+            ...(payloadCore as any),
             workflowStateId: state?.id || '',
-            sourceUrl: url,
             source: 'codemagen_scraper',
-            metadata: metadata as any,
-            syncJobId: jobId,
-            assignees: assigneeIds.length > 0 ? { connect: assigneeIds.map(id => ({ id })) } : undefined
-          }
+            ...(assigneeIds.length > 0 ?
+              { assignees: { connect: assigneeIds.map((uid) => ({ id: uid })) } }
+            : {}),
+          },
         });
       }
 

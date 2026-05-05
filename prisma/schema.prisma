@@ -275,6 +275,7 @@ model Company {
   organisation Organisation   @relation(fields: [organisationId], references: [id], onDelete: Cascade)
   members      CompanyMember[]
   projects     Project[]
+  tickets      Ticket[]
 
   @@index([organisationId])
   @@map("companies")
@@ -332,6 +333,7 @@ model Project {
   analytics        ProjectAnalytic[]
   workflowStates   WorkflowState[]
   sheetSyncConfigs SheetSyncConfig[]
+  legacySheetTargets SheetSyncConfig[] @relation("LegacySheetTarget")
   externalSyncJobs ExternalSyncJob[]
   milestones       ProjectMilestone[]
   docs             ProjectDoc[]
@@ -415,6 +417,7 @@ enum TicketType {
 model Ticket {
   id              String         @id @default(uuid())
   projectId       String
+  companyId       String?
   sprintId        String?
   workflowStateId String?
   parentId        String?
@@ -433,6 +436,8 @@ model Ticket {
   screen          String?
   tags            String[]
   sourceUrl       String?
+  legacySourceKey String?         @unique
+  legacyIssueNumber Int?
   sourceRef       String?
   source          String         @default("manual") // "manual" | "excel" | "google_sheets"
   rowHash         String?
@@ -443,6 +448,7 @@ model Ticket {
   deletedAt       DateTime?
 
   project         Project                @relation(fields: [projectId], references: [id])
+  company         Company?               @relation(fields: [companyId], references: [id], onDelete: SetNull)
   sprint          Sprint?                @relation(fields: [sprintId], references: [id])
   workflowState   WorkflowState?         @relation(fields: [workflowStateId], references: [id])
   assignees       User[]                 @relation("TicketAssignees")
@@ -467,6 +473,7 @@ model Ticket {
   @@index([projectId])
   @@index([sprintId])
   @@index([sourceUrl])
+  @@index([legacyIssueNumber])
   @@map("tickets")
 }
 
@@ -747,21 +754,23 @@ model ExcelImport {
 
 // Persisted Google Sheet sync configuration per project
 model SheetSyncConfig {
-  id            String    @id @default(uuid())
-  projectId     String
-  sheetId       String // Google Sheet ID extracted from URL
-  sheetUrl      String // Original URL for display
-  sheetName     String? // Optional specific sheet/tab name
-  columnMapping Json // { title: "Task", status: "Status", module: "Module", sourceUrl: "Ticket" }
-  isEnabled     Boolean   @default(true)
-  intervalMins  Int       @default(30)
-  lastSyncAt    DateTime?
-  lastSyncStats Json? // { created, updated, skipped, failed }
-  createdBy     String?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  id                    String    @id @default(uuid())
+  projectId             String
+  legacyTicketProjectId String?
+  sheetId               String // Google Sheet ID extracted from URL
+  sheetUrl              String // Original URL for display
+  sheetName             String? // Optional specific sheet/tab name
+  columnMapping         Json // { title: "Task", status: "Status", module: "Module", sourceUrl: "Ticket" }
+  isEnabled             Boolean   @default(true)
+  intervalMins          Int       @default(30)
+  lastSyncAt            DateTime?
+  lastSyncStats         Json? // { created, updated, skipped, failed }
+  createdBy             String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
 
-  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project               Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  legacyTicketProject   Project? @relation("LegacySheetTarget", fields: [legacyTicketProjectId], references: [id], onDelete: SetNull)
 
   @@unique([projectId, sheetId])
   @@map("sheet_sync_configs")

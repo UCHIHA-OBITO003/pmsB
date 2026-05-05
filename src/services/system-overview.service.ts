@@ -5,6 +5,7 @@ import { config } from '../utils/config';
 import { smtpCredentialsPresent } from './email.service';
 import { CRON_MANIFEST } from '../crons/definitions';
 import { getApiHitsSnapshot } from '../utils/api-request-metrics';
+import { getQueueMetrics } from '../queues/index';
 
 function formatCronEntries() {
   return CRON_MANIFEST.map((row) => ({
@@ -57,12 +58,21 @@ export async function buildSystemOverview() {
   let redisOk = false;
   let redisDbSize: number | null = null;
   let redisErr: string | undefined;
+  let queueMetrics: Awaited<ReturnType<typeof getQueueMetrics>> | null = null;
 
   try {
     redisOk = (await redis.ping()) === 'PONG';
     if (redisOk) redisDbSize = await redis.dbsize();
   } catch (e) {
     redisErr = e instanceof Error ? e.message : String(e);
+  }
+
+  if (redisOk) {
+    try {
+      queueMetrics = await getQueueMetrics();
+    } catch {
+      // non-fatal: queue metrics unavailable if Redis key format changed
+    }
   }
 
   const dbFootprint = await postgresDbFootprint();
@@ -124,9 +134,20 @@ export async function buildSystemOverview() {
       externalSyncExplanation:
         'external_sync_jobs (mass import sync). Pending = PENDING; running = PROCESSING.',
     },
+    queues: queueMetrics
+      ? {
+          driver: 'BullMQ (Redis-backed)',
+          workersActive: true,
+          metrics: queueMetrics,
+          note: 'import-job: Google Sheet syncs + Excel file imports. email-job: outgoing SMTP mail. Completed/failed counts reset when the process restarts (removeOnComplete/removeOnFail limits apply).',
+        }
+      : {
+          driver: 'BullMQ (Redis-backed)',
+          workersActive: true,
+          metrics: null,
+          note: 'Queue metrics unavailable — Redis may not be connected yet.',
+        },
     infrastructureNote:
       'VRAM-style limits and egress charts remain in Render / host dashboards — here you see process-visible memory plus DB/Redis pings.',
-    jobQueueDisclaimer:
-      'BullMQ appears in dependencies but no queue workers are mounted; there is no central job backlog metric beyond cron + DB tables above.',
   };
 }

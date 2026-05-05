@@ -4,10 +4,10 @@ import { randomUUID } from 'crypto';
 import multer from 'multer';
 import { z } from 'zod';
 import { prisma } from '../utils/prisma';
-import { authenticate, requirePermission, AuthRequest } from '../middleware/auth';
+import { authenticate, requirePermission, requireRole, AuthRequest } from '../middleware/auth';
 import { AppError } from '../middleware/errorHandler';
 import { applyTicketParticipantScope } from '../utils/ticket-access';
-import type { Prisma, TicketPriority } from '@prisma/client';
+import type { Prisma, TicketPriority, TicketType } from '@prisma/client';
 import { redmineScraper } from '../services/redmine-scraper.service';
 import { PRIORITY_MAP } from '../utils/mappings';
 import { massScraper } from '../services/mass-scraper.service';
@@ -17,6 +17,11 @@ import {
   notifyTicketUpdated,
 } from '../services/ticket-notification.service';
 import { config } from '../utils/config';
+import {
+  dedupeTicketsByLegacyKey,
+  remediateLegacyCodemagenTickets,
+} from '../services/legacy-ticket-remediation.service';
+import { parseLegacyTicketSource } from '../utils/legacy-source-url';
 
 const router = Router();
 router.use(authenticate);
@@ -96,6 +101,8 @@ function slaForTicket(t: { priority: string; dueDate: Date | null; createdAt: Da
 }
 
 const MASS_SYNC_STALE_MINUTES = 10;
+/** Hard cap for GET /api/tickets page size — large payloads; prefer filters + paging when possible */
+const TICKET_LIST_MAX_LIMIT = 25_000;
 
 async function failStaleMassSyncJobs(): Promise<void> {
   const cutoff = new Date(Date.now() - MASS_SYNC_STALE_MINUTES * 60 * 1000);
@@ -128,6 +135,7 @@ const TicketSchema = z.object({
   tags: z.array(z.string()).default([]),
   parentId: z.string().uuid().optional(),
   workflowStateId: z.string().min(1).optional(),
+  companyId: z.union([z.string().uuid(), z.null()]).optional(),
 });
 
 // POST /api/tickets/sync-external
@@ -237,49 +245,89 @@ router.get('/mass-sync/status', requirePermission('tickets', 'read'), async (req
 // GET /api/tickets
 router.get('/', requirePermission('tickets', 'read'), async (req: AuthRequest, res) => {
   const {
-    projectId, sprintId, assigneeIds, status, type, priority,
-    search, page = '1', limit = '50', team
+    projectId,
+    sprintId,
+    assigneeIds,
+    assigneeId,
+    status,
+    type,
+    priority,
+    search,
+    page = '1',
+    limit = '50',
+    team,
+    companyId,
+    organisationId,
+    sort,
   } = req.query as Record<string, string>;
   const limitNum = parseInt(String(limit), 10);
-  const take = Math.min(Math.max(Number.isFinite(limitNum) ? limitNum : 50, 1), 100);
+  const take = Math.min(Math.max(Number.isFinite(limitNum) ? limitNum : 50, 1), TICKET_LIST_MAX_LIMIT);
   const pageNum = Math.max(parseInt(String(page), 10) || 1, 1);
   const skip = (pageNum - 1) * take;
 
-  const where: any = { deletedAt: null };
+  const where: Prisma.TicketWhereInput = { deletedAt: null };
   if (projectId) where.projectId = projectId;
   if (sprintId) where.sprintId = sprintId;
-  if (assigneeIds && assigneeIds.length > 0) {
-    where.assignees = { some: { id: { in: assigneeIds.split(',') } } };
-  }
-  if (type) where.type = type;
-  if (priority) where.priority = priority;
+  if (type) where.type = type as TicketType;
+  if (priority) where.priority = priority as TicketPriority;
   if (search) where.title = { contains: search, mode: 'insensitive' };
   if (status) where.workflowState = { slug: status };
-  
-  if (team) {
+  if (companyId) where.companyId = companyId;
+  if (organisationId) where.company = { organisationId };
+
+  const assigneeIdList =
+    assigneeIds && assigneeIds.length > 0
+      ? assigneeIds.split(',').filter(Boolean)
+      : assigneeId && assigneeId.trim().length > 0
+        ? [assigneeId.trim()]
+        : [];
+
+  const filterAnd: Prisma.TicketWhereInput[] = [];
+
+  if (assigneeIdList.length > 0) {
+    filterAnd.push({ assignees: { some: { id: { in: assigneeIdList } } } });
+  }
+
+  if (team && team !== 'ALL' && req.query.mine !== 'true') {
     if (team === 'hanz') {
-      where.assignees = {
-        some: { department: 'Hanz' },
-        every: { department: 'Hanz' }
-      };
+      filterAnd.push({
+        assignees: { some: { department: 'Hanz' }, every: { department: 'Hanz' } },
+      });
     } else if (team === 'codemagen') {
-      where.assignees = {
-        some: { department: 'Codemagen' },
-        every: { department: 'Codemagen' }
-      };
+      filterAnd.push({
+        assignees: { some: { department: 'Codemagen' }, every: { department: 'Codemagen' } },
+      });
     } else if (team === 'common') {
-      where.AND = [
-        { assignees: { some: { department: 'Hanz' } } },
-        { assignees: { some: { department: 'Codemagen' } } }
-      ];
+      filterAnd.push({
+        AND: [
+          { assignees: { some: { department: 'Hanz' } } },
+          { assignees: { some: { department: 'Codemagen' } } },
+        ],
+      });
     }
   }
 
   if (req.query.mine === 'true') {
-    where.assignees = { some: { id: req.user!.id } };
-  } else {
-    applyTicketParticipantScope(where, req.user!.id, req.user!.roles);
+    filterAnd.push({ assignees: { some: { id: req.user!.id } } });
   }
+
+  if (filterAnd.length > 0) {
+    const prevAnd = where.AND;
+    where.AND =
+      prevAnd === undefined ? filterAnd : Array.isArray(prevAnd) ? [...prevAnd, ...filterAnd] : [prevAnd, ...filterAnd];
+  }
+
+  applyTicketParticipantScope(where, req.user!.id, req.user!.roles);
+
+  const orderBy: Prisma.TicketOrderByWithRelationInput[] =
+    sort === 'legacy' ?
+      [
+        {
+          legacyIssueNumber: 'asc',
+        },
+        { createdAt: 'desc' },
+      ]
+    : [{ createdAt: 'desc' }];
 
   const [tickets, total] = await prisma.$transaction([
     prisma.ticket.findMany({
@@ -288,9 +336,11 @@ router.get('/', requirePermission('tickets', 'read'), async (req: AuthRequest, r
         assignees: { select: { id: true, firstName: true, lastName: true, avatar: true } },
         reporter: { select: { id: true, firstName: true, lastName: true } },
         workflowState: true,
+        project: { select: { id: true, name: true, key: true } },
+        company: { select: { id: true, name: true, organisationId: true } },
         _count: { select: { comments: true, attachments: true, children: true } },
       },
-      orderBy: [{ createdAt: 'desc' }],
+      orderBy,
       skip,
       take,
     }),
@@ -442,6 +492,36 @@ router.get('/form-suggestions', requirePermission('tickets', 'read'), async (req
       recentTitles,
     },
   });
+  });
+
+/** Dropdown data for ticket list filters (accessible with tickets:read). */
+router.get('/filter-options', requirePermission('tickets', 'read'), async (_req: AuthRequest, res) => {
+  const [projects, companies, organisations, activeUsers] = await Promise.all([
+    prisma.project.findMany({
+      where: { deletedAt: null },
+      select: { id: true, name: true, key: true, companyId: true },
+      orderBy: { name: 'asc' },
+      take: 500,
+    }),
+    prisma.company.findMany({
+      where: { deletedAt: null },
+      select: { id: true, name: true, organisationId: true },
+      orderBy: { name: 'asc' },
+      take: 500,
+    }),
+    prisma.organisation.findMany({
+      select: { id: true, name: true },
+      orderBy: { name: 'asc' },
+      take: 200,
+    }),
+    prisma.user.findMany({
+      where: { deletedAt: null, status: 'ACTIVE' },
+      select: { id: true, firstName: true, lastName: true, email: true },
+      orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }],
+      take: 800,
+    }),
+  ]);
+  res.json({ success: true, data: { projects, companies, organisations, users: activeUsers } });
 });
 
 router.get('/ticket-templates', requirePermission('tickets', 'read'), async (req: AuthRequest, res) => {
@@ -520,6 +600,44 @@ router.post(
   },
 );
 
+// POST /api/tickets/admin-remediate-legacy — move Codemagen/sheet rows + backfill keys (admin)
+router.post('/admin-remediate-legacy', requireRole('admin'), async (req, res) => {
+  const body = z
+    .object({
+      targetProjectKey: z.string().min(1).default('EEP'),
+      dryRun: z.boolean().optional(),
+    })
+    .parse(req.body ?? {});
+  try {
+    const data = await remediateLegacyCodemagenTickets({
+      targetProjectKey: body.targetProjectKey,
+      dryRun: body.dryRun,
+    });
+    res.json({ success: true, data });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : '';
+    if (msg.startsWith('PROJECT_NOT_FOUND')) {
+      throw new AppError(404, 'Target project not found', 'NOT_FOUND');
+    }
+    throw e;
+  }
+});
+
+// POST /api/tickets/admin-dedupe-legacy — collapse duplicate legacySourceKey rows (admin)
+router.post('/admin-dedupe-legacy', requireRole('admin'), async (req, res) => {
+  const body = z
+    .object({
+      preferProjectKey: z.string().min(1).optional(),
+      dryRun: z.boolean().optional(),
+    })
+    .parse(req.body ?? {});
+  const data = await dedupeTicketsByLegacyKey({
+    preferProjectKey: body.preferProjectKey,
+    dryRun: body.dryRun,
+  });
+  res.json({ success: true, data });
+});
+
 // POST /api/tickets/:id/sync-legacy — re-scrape Redmine/Codemagen and merge metadata + core fields
 router.post('/:id/sync-legacy', requirePermission('tickets', 'update'), async (req: AuthRequest, res) => {
   const whereLookup: Prisma.TicketWhereInput = { id: req.params.id, deletedAt: null };
@@ -539,11 +657,15 @@ router.post('/:id/sync-legacy', requirePermission('tickets', 'update'), async (r
   const converted = (metadata.converted || {}) as Record<string, unknown>;
   const legacyApply = legacyPatchFromConverted(converted);
 
+  const parts = parseLegacyTicketSource(existing.sourceUrl);
+
   await prisma.ticket.update({
     where: { id: existing.id },
     data: {
       metadata: metadata as any,
       ...legacyApply,
+      ...(parts.legacySourceKey ? { legacySourceKey: parts.legacySourceKey } : {}),
+      ...(parts.issueNumber != null ? { legacyIssueNumber: parts.issueNumber } : {}),
     },
   });
 
@@ -562,6 +684,7 @@ router.get('/:id', requirePermission('tickets', 'read'), async (req: AuthRequest
       reporter: { select: { id: true, firstName: true, lastName: true } },
       workflowState: true,
       project: { select: { id: true, name: true, key: true } },
+      company: { select: { id: true, name: true, organisationId: true } },
       sprint: { select: { id: true, name: true, status: true } },
       comments: {
         where: { deletedAt: null },

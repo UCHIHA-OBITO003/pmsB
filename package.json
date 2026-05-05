@@ -13,6 +13,7 @@
     "db:migrate:deploy": "prisma migrate deploy",
     "db:studio": "prisma studio",
     "db:seed": "tsx prisma/seed.ts",
+    "db:backfill-pmslocal-roles": "tsx scripts/backfill-pmslocal-developer-role.ts",
     "db:generate": "prisma generate",
     "lint": "eslint src --ext .ts"
   },

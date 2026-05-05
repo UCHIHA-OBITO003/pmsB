@@ -31,6 +31,7 @@ import timesheetRoutes from './routes/timesheet.routes';
 import systemRoutes from './routes/system.routes';
 import organisationRoutes from './routes/organisation.routes';
 import companyRoutes from './routes/company.routes';
+import teamRoutes from './routes/team.routes';
 
 const app = express();
 
@@ -104,6 +105,7 @@ app.use('/api/timesheets', timesheetRoutes);
 app.use('/api/system', systemRoutes);
 app.use('/api/organisations', organisationRoutes);
 app.use('/api/companies', companyRoutes);
+app.use('/api/teams', teamRoutes);
 app.use('/uploads', express.static(path.resolve(config.upload.dir)));
 
 // Error handler (must be last)

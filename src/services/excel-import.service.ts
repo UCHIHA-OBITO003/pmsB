@@ -2,13 +2,12 @@ import ExcelJS from 'exceljs';
 import crypto from 'crypto';
 import { google } from 'googleapis';
 import { STATUS_MAP, PRIORITY_MAP } from '../utils/mappings';
-import { resolveUserAlias, isHanzDeveloper } from '../utils/user-mapping';
-import bcrypt from 'bcryptjs';
 import { prisma } from '../utils/prisma';
+import { resolveOrCreateDeveloperFromAssignee } from '../utils/assignee-import-user';
 import { config } from '../utils/config';
 import { logger } from '../utils/logger';
-
-// ─── Google Auth Helper ──────────────────────────────────────────────────────
+import { parseLegacyTicketSource } from '../utils/legacy-source-url';
+import { resolveLegacyTicketProjectId } from '../utils/legacy-project';
 
 // ─── Google Auth Helper ──────────────────────────────────────────────────────
 
@@ -73,6 +72,7 @@ export const excelImportService = {
     intervalMins?: number;
     createdBy?: string;
     sheetName?: string;
+    legacyTicketProjectId?: string | null;
   }) {
     const sheetId = extractSheetId(data.sheetUrl);
     if (!sheetId) throw new Error('Invalid Google Sheet URL');
@@ -90,6 +90,7 @@ export const excelImportService = {
           intervalMins: data.intervalMins ?? 30,
           isEnabled: true,
           sheetName: data.sheetName,
+          legacyTicketProjectId: data.legacyTicketProjectId ?? undefined,
         },
       });
     }
@@ -103,6 +104,7 @@ export const excelImportService = {
         columnMapping: data.columnMapping,
         intervalMins: data.intervalMins ?? 30,
         createdBy: data.createdBy,
+        legacyTicketProjectId: data.legacyTicketProjectId ?? undefined,
       },
     });
   },
@@ -110,7 +112,10 @@ export const excelImportService = {
   // ── List all sync configs (with project info) ────────────────────────────
   async listSyncConfigs() {
     return (prisma as any).sheetSyncConfig.findMany({
-      include: { project: { select: { id: true, name: true, key: true } } },
+      include: {
+        project: { select: { id: true, name: true, key: true } },
+        legacyTicketProject: { select: { id: true, name: true, key: true } },
+      },
       orderBy: { createdAt: 'desc' },
     });
   },
@@ -135,11 +140,11 @@ export const excelImportService = {
       assignees: 'Assignee',
     },
     configId?: string,
+    sheetOptions?: { legacyTicketProjectId?: string | null },
   ) {
     const start = Date.now();
     logger.info({ sheetId, projectId }, 'Starting Google Sheet sync');
 
-    // Fetch sheet data
     const auth = await getGoogleAuth();
     const sheets = google.sheets({ version: 'v4', auth: await auth.getClient() as any });
 
@@ -151,13 +156,20 @@ export const excelImportService = {
     const values = res.data.values || [];
     if (values.length === 0) {
       logger.warn({ sheetId }, 'Sheet is empty, skipping sync');
-      return { importId: null, created: 0, updated: 0, skipped: 0, failed: 0 };
+      return {
+        importId: null,
+        created: 0,
+        updated: 0,
+        skipped: 0,
+        failed: 0,
+        duplicatesPrevented: 0,
+        legacyTargetProjectId: null as string | null,
+      };
     }
 
     const [rawHeaders, ...rows] = values;
     const headers: string[] = (rawHeaders || []).map(String);
 
-    // Create import log
     const importLog = await prisma.excelImport.create({
       data: {
         source: 'google_sheets',
@@ -169,19 +181,50 @@ export const excelImportService = {
       },
     });
 
-    let created = 0, updated = 0, skipped = 0, failed = 0;
+    const legacyProj = await resolveLegacyTicketProjectId(sheetOptions?.legacyTicketProjectId ?? undefined);
 
-    // Get workflow states for this project
-    const workflowStates = await prisma.workflowState.findMany({ where: { projectId } });
-    const defaultState = workflowStates.find((s) => s.isDefault) || workflowStates[0];
-    const stateBySlug = Object.fromEntries(workflowStates.map((s) => [s.slug, s]));
+    let created = 0,
+      updated = 0,
+      skipped = 0,
+      failed = 0,
+      duplicatesPrevented = 0;
+
+    type WF = Awaited<ReturnType<typeof prisma.workflowState.findMany>>;
+    const wfCache = new Map<
+      string,
+      {
+        workflowStates: WF;
+        defaultState: WF[0] | undefined;
+        stateBySlug: Record<string, WF[0]>;
+      }
+    >();
+
+    async function wfFor(pid: string) {
+      if (!wfCache.has(pid)) {
+        const workflowStates = await prisma.workflowState.findMany({ where: { projectId: pid } });
+        const defaultState = workflowStates.find((s) => s.isDefault) || workflowStates[0];
+        const stateBySlug = Object.fromEntries(workflowStates.map((s) => [s.slug, s]));
+        wfCache.set(pid, { workflowStates, defaultState, stateBySlug });
+      }
+      return wfCache.get(pid)!;
+    }
+
+    const companyCache = new Map<string, string | null>();
+    async function companyForProject(pid: string) {
+      if (!companyCache.has(pid)) {
+        const p = await prisma.project.findUnique({ where: { id: pid }, select: { companyId: true } });
+        companyCache.set(pid, p?.companyId ?? null);
+      }
+      return companyCache.get(pid)!;
+    }
 
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
       const raw: Record<string, string> = {};
-      headers.forEach((h, j) => { raw[h] = String(row[j] || '').trim(); });
+      headers.forEach((h, j) => {
+        raw[h] = String(row[j] || '').trim();
+      });
 
-      // Resolve fields using column mapping (fall back to common names)
       const title = raw[columnMapping.title] || raw['Task'] || raw['Title'] || '';
       if (!title || title.toLowerCase() === 'null' || title.toLowerCase() === 'undefined') {
         skipped++;
@@ -190,110 +233,113 @@ export const excelImportService = {
 
       const statusRaw = raw[columnMapping.status] || raw['Status'] || '';
       const statusSlug = STATUS_MAP[statusRaw] || 'todo';
-      const state = stateBySlug[statusSlug] || defaultState;
 
-      let sourceUrl = raw[columnMapping.sourceUrl] || raw['Ticket'] || raw['URL'] || '';
-      // Extract http/https url if mixed with text like "Ticket #200 https://pms..."
-      const urlMatch = sourceUrl.match(/https?:\/\/[^\s]+/);
-      if (urlMatch) {
-        sourceUrl = urlMatch[0].trim();
+      let sourceCell = raw[columnMapping.sourceUrl] || raw['Ticket'] || raw['URL'] || '';
+      const urlMatch = sourceCell.match(/https?:\/\/[^\s]+/i);
+      const shortUrl = urlMatch ? urlMatch[0].trim() : sourceCell.trim();
+
+      const { legacySourceKey, canonicalUrl, issueNumber } = parseLegacyTicketSource(sourceCell);
+      const resolvedSourceUrl = canonicalUrl || (shortUrl ? shortUrl : null);
+      const isCodemagenLegacy = !!(legacySourceKey && legacySourceKey.startsWith('codemagen:'));
+      const effectiveProjectId = isCodemagenLegacy && legacyProj ? legacyProj.id : projectId;
+
+      if (isCodemagenLegacy && legacyProj && legacyProj.id !== projectId) {
+        duplicatesPrevented++;
       }
+
+      const bundle = await wfFor(effectiveProjectId);
+      const state = bundle.stateBySlug[statusSlug] || bundle.defaultState;
+
       const module = raw[columnMapping.module] || raw['Module'] || null;
       const priorityRaw = raw[columnMapping.priority] || raw['Priority'] || '';
       const priority = (PRIORITY_MAP[priorityRaw] || 'MEDIUM') as any;
       const description = raw[columnMapping.description] || raw['Description'] || null;
 
-      // Parse assignees
       const assigneesRaw = raw[columnMapping.assignees] || raw['Assignees'] || raw['Assignee'] || raw['k'] || '';
       const assigneeNames = assigneesRaw
         .split(/&|\||,|and/i)
-        .map(n => n.trim())
-        .filter(n => n.length > 0);
+        .map((n) => n.trim())
+        .filter((n) => n.length > 0);
 
       const assigneeIds: string[] = [];
-      for (let rawName of assigneeNames) {
-        const name = resolveUserAlias(rawName);
-        
-        // Try to find user by firstName (case-insensitive)
-        let user = await prisma.user.findFirst({
-          where: { firstName: { equals: name, mode: 'insensitive' }, deletedAt: null }
-        });
+      for (const rawName of assigneeNames) {
+        const user = await resolveOrCreateDeveloperFromAssignee(rawName);
+        if (!user) continue;
 
-        if (!user) {
-          // Auto-create user
-          const email = `${name.toLowerCase().replace(/[^a-z0-9]/g, '')}@pms.local`;
-          const hash = await bcrypt.hash('Dev@123456', 10);
-          const department = isHanzDeveloper(name) ? 'Hanz' : 'Codemagen';
-          
-          user = await prisma.user.create({
-            data: {
-              firstName: name,
-              lastName: '',
-              email,
-              department,
-              password: hash,
-              roles: {
-                create: {
-                  role: { connect: { name: 'DEVELOPER' } }
-                }
-              }
-            }
-          }).catch(async () => {
-             // If email exists or role connection fails, just create without role
-             return prisma.user.create({
-               data: { firstName: name, lastName: '', email: `${Date.now()}@pms.local`, password: hash, department }
-             });
-          });
-          logger.info({ userId: user.id, name, department }, 'Auto-created new developer account');
-        }
-
-        // Add to project if not already
         const member = await prisma.projectMember.findFirst({
-          where: { projectId, userId: user.id }
+          where: { projectId: effectiveProjectId, userId: user.id },
         });
         if (!member) {
-          await prisma.projectMember.create({
-            data: { projectId, userId: user.id, role: 'developer' }
-          }).catch(() => {});
+          await prisma.projectMember
+            .create({
+              data: { projectId: effectiveProjectId, userId: user.id, role: 'developer' },
+            })
+            .catch(() => {});
         }
 
         assigneeIds.push(user.id);
       }
 
-      // Row hash for delta sync (skip rows that haven't changed)
       const rowHash = crypto.createHash('md5').update(JSON.stringify(raw)).digest('hex');
 
-      // Find existing ticket by sourceUrl (most reliable key)
-      const existing = sourceUrl
-        ? await prisma.ticket.findFirst({ where: { sourceUrl, projectId, deletedAt: null }, include: { assignees: true } })
-        : await prisma.ticket.findFirst({ where: { title, projectId, source: 'google_sheets', deletedAt: null }, include: { assignees: true } });
+      let existing =
+        legacySourceKey ?
+          await prisma.ticket.findFirst({
+            where: { legacySourceKey, deletedAt: null },
+            include: { assignees: true },
+          })
+        : resolvedSourceUrl ?
+          await prisma.ticket.findFirst({
+            where: {
+              deletedAt: null,
+              OR: [{ sourceUrl: resolvedSourceUrl }, ...(sourceCell && sourceCell !== resolvedSourceUrl ? [{ sourceUrl: sourceCell.trim() }] : [])],
+            },
+            include: { assignees: true },
+          })
+        : await prisma.ticket.findFirst({
+            where: {
+              title: String(title),
+              projectId: effectiveProjectId,
+              source: 'google_sheets',
+              deletedAt: null,
+            },
+            include: { assignees: true },
+          });
 
       if (existing?.rowHash === rowHash) {
         skipped++;
         continue;
       }
 
-      const baseTicketFields = {
-        projectId,
+      const companyRow = isCodemagenLegacy ? await companyForProject(effectiveProjectId) : null;
+
+      const baseTicketFields: Record<string, unknown> = {
+        projectId: effectiveProjectId,
         title: String(title).slice(0, 500),
         description: description ? String(description).slice(0, 5000) : null,
         workflowStateId: state?.id,
         module: module ? String(module) : null,
-        sourceUrl: sourceUrl || null,
+        sourceUrl: resolvedSourceUrl,
+        legacySourceKey,
+        legacyIssueNumber: issueNumber ?? undefined,
         source: 'google_sheets' as const,
         rowHash,
         importId: importLog.id,
         priority,
       };
 
-      const assigneesWrite =
-        assigneeIds.length > 0
-          ? existing
-            ? { assignees: { set: assigneeIds.map((id) => ({ id })) } }
-            : { assignees: { connect: assigneeIds.map((id) => ({ id })) } }
-          : {};
+      if (companyRow) {
+        baseTicketFields.companyId = companyRow;
+      }
 
-      const ticketData = { ...baseTicketFields, ...assigneesWrite };
+      const assigneesWrite =
+        assigneeIds.length > 0 ?
+          existing ?
+            { assignees: { set: assigneeIds.map((id) => ({ id })) } }
+          : { assignees: { connect: assigneeIds.map((id) => ({ id })) } }
+        : {};
+
+      const ticketData = { ...baseTicketFields, ...assigneesWrite } as any;
 
       try {
         if (existing) {
@@ -304,27 +350,31 @@ export const excelImportService = {
           created++;
         }
 
-        await prisma.excelImportRow.create({
-          data: {
-            importId: importLog.id,
-            rowNumber: i + 2, // +2 because row 1 is header, and 0-indexed
-            rawData: raw,
-            mappedData: ticketData,
-            status: existing ? 'updated' : 'created',
-          },
-        }).catch(() => {}); // Non-critical
+        await prisma.excelImportRow
+          .create({
+            data: {
+              importId: importLog.id,
+              rowNumber: i + 2,
+              rawData: raw,
+              mappedData: ticketData,
+              status: existing ? 'updated' : 'created',
+            },
+          })
+          .catch(() => {});
       } catch (e: any) {
         failed++;
         logger.error({ err: e, rowNumber: i + 2 }, 'Sheet sync row failed');
-        await prisma.excelImportRow.create({
-          data: {
-            importId: importLog.id,
-            rowNumber: i + 2,
-            rawData: raw,
-            status: 'failed',
-            error: e.message,
-          },
-        }).catch(() => {});
+        await prisma.excelImportRow
+          .create({
+            data: {
+              importId: importLog.id,
+              rowNumber: i + 2,
+              rawData: raw,
+              status: 'failed',
+              error: e.message,
+            },
+          })
+          .catch(() => {});
       }
     }
 
@@ -334,35 +384,46 @@ export const excelImportService = {
       updated,
       skipped,
       failed,
+      duplicatesPrevented,
+      legacyTargetProjectId: legacyProj?.id ?? null,
       totalRows: rows.length,
       durationMs: Date.now() - start,
     };
 
-    // Finalize import log
     await prisma.excelImport.update({
       where: { id: importLog.id },
-      data: { status: failed > 0 && created + updated === 0 ? 'FAILED' : 'COMPLETED', totalRows: rows.length, created, updated, skipped, failed, completedAt: new Date() },
+      data: {
+        status: failed > 0 && created + updated === 0 ? 'FAILED' : 'COMPLETED',
+        totalRows: rows.length,
+        created,
+        updated,
+        skipped,
+        failed,
+        completedAt: new Date(),
+      },
     });
 
-    // Update SheetSyncConfig last sync time
     if (configId) {
-      await (prisma as any).sheetSyncConfig.update({
-        where: { id: configId },
-        data: { lastSyncAt: new Date(), lastSyncStats: stats },
-      }).catch(() => {});
+      await (prisma as any).sheetSyncConfig
+        .update({
+          where: { id: configId },
+          data: { lastSyncAt: new Date(), lastSyncStats: stats },
+        })
+        .catch(() => {});
     }
 
-    // Create insight event if changes were found
     if (created > 0 || updated > 0) {
-      await prisma.insightEvent.create({
-        data: {
-          projectId,
-          type: 'sheet_sync',
-          title: 'Google Sheet synced',
-          body: `Auto-sync: ${created} tickets created, ${updated} updated from Google Sheet`,
-          severity: 'info',
-        },
-      }).catch(() => {});
+      await prisma.insightEvent
+        .create({
+          data: {
+            projectId: legacyProj?.id ?? projectId,
+            type: 'sheet_sync',
+            title: 'Google Sheet synced',
+            body: `Auto-sync: ${created} created, ${updated} updated, duplicatesAvoided~${duplicatesPrevented} (Codemagen rows → legacy project)`,
+            severity: 'info',
+          },
+        })
+        .catch(() => {});
     }
 
     logger.info(stats, 'Google Sheet sync complete');
@@ -394,6 +455,7 @@ export const excelImportService = {
           'system',
           cm,
           cfg.id,
+          { legacyTicketProjectId: cfg.legacyTicketProjectId },
         );
       } catch (e: any) {
         logger.error({ err: e, configId: cfg.id, projectId: cfg.projectId }, 'Sheet sync failed for config');
