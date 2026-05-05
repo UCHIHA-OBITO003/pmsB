@@ -7,8 +7,9 @@ import { prisma } from '../utils/prisma';
 import { authenticate, requirePermission, AuthRequest } from '../middleware/auth';
 import { AppError } from '../middleware/errorHandler';
 import { applyTicketParticipantScope } from '../utils/ticket-access';
-import type { Prisma } from '@prisma/client';
+import type { Prisma, TicketPriority } from '@prisma/client';
 import { redmineScraper } from '../services/redmine-scraper.service';
+import { PRIORITY_MAP } from '../utils/mappings';
 import { massScraper } from '../services/mass-scraper.service';
 import {
   notifyTicketComment,
@@ -19,6 +20,45 @@ import { config } from '../utils/config';
 
 const router = Router();
 router.use(authenticate);
+
+/** Map Redmine JSON `converted` blob onto Prisma ticket fields (description, priority, dates, estimate). */
+function legacyPatchFromConverted(converted: Record<string, unknown>): Prisma.TicketUpdateInput {
+  const data: Prisma.TicketUpdateInput = {};
+  const desc = converted.description;
+  if (typeof desc === 'string' && desc.trim()) data.description = desc.trim();
+
+  const pr = converted.Priority;
+  if (typeof pr === 'string' && PRIORITY_MAP[pr]) {
+    data.priority = PRIORITY_MAP[pr] as TicketPriority;
+  }
+
+  const estRaw = converted['Estimated Time'];
+  const hours = parseEstimatedHoursFromLegacy(estRaw);
+  if (hours != null) data.estimatedHours = hours;
+
+  const due = parseYmd(converted['Due Date']);
+  if (due) data.dueDate = due;
+
+  const start = parseYmd(converted['Start Date']);
+  if (start) data.startedAt = start;
+
+  return data;
+}
+
+function parseYmd(val: unknown): Date | undefined {
+  if (typeof val !== 'string' || !val.trim()) return undefined;
+  const t = Date.parse(val.trim());
+  return Number.isNaN(t) ? undefined : new Date(t);
+}
+
+function parseEstimatedHoursFromLegacy(val: unknown): number | undefined {
+  if (typeof val === 'number' && Number.isFinite(val)) return val;
+  if (typeof val !== 'string') return undefined;
+  const m = val.match(/([\d.]+)/);
+  if (!m) return undefined;
+  const n = parseFloat(m[1]);
+  return Number.isFinite(n) ? n : undefined;
+}
 
 const ticketUploadStorage = multer.diskStorage({
   destination: (_req, _file, cb) => {
@@ -94,9 +134,14 @@ router.post('/sync-external', requirePermission('tickets', 'update'), async (req
       
       try {
         const metadata = await redmineScraper.scrapeIssue(ticket.sourceUrl);
+        const converted = (metadata.converted || {}) as Record<string, unknown>;
+        const legacyApply = legacyPatchFromConverted(converted);
         await prisma.ticket.update({
           where: { id: ticket.id },
-          data: { metadata: metadata as any }
+          data: {
+            metadata: metadata as any,
+            ...legacyApply,
+          },
         });
         success++;
       } catch (err) {
@@ -424,6 +469,36 @@ router.post(
     res.status(201).json({ success: true, data: ticket });
   },
 );
+
+// POST /api/tickets/:id/sync-legacy — re-scrape Redmine/Codemagen and merge metadata + core fields
+router.post('/:id/sync-legacy', requirePermission('tickets', 'update'), async (req: AuthRequest, res) => {
+  const whereLookup: Prisma.TicketWhereInput = { id: req.params.id, deletedAt: null };
+  applyTicketParticipantScope(whereLookup, req.user!.id, req.user!.roles);
+  const existing = await prisma.ticket.findFirst({
+    where: whereLookup,
+    select: { id: true, sourceUrl: true },
+  });
+  if (!existing?.sourceUrl) {
+    throw new AppError(400, 'Ticket has no legacy source URL to sync', 'BAD_REQUEST');
+  }
+  if (!existing.sourceUrl.includes('codemagen')) {
+    throw new AppError(400, 'Legacy sync only supports Codemagen/Redmine URLs', 'BAD_REQUEST');
+  }
+
+  const metadata = await redmineScraper.scrapeIssue(existing.sourceUrl);
+  const converted = (metadata.converted || {}) as Record<string, unknown>;
+  const legacyApply = legacyPatchFromConverted(converted);
+
+  await prisma.ticket.update({
+    where: { id: existing.id },
+    data: {
+      metadata: metadata as any,
+      ...legacyApply,
+    },
+  });
+
+  res.json({ success: true, message: 'Legacy data refreshed' });
+});
 
 // GET /api/tickets/:id
 router.get('/:id', requirePermission('tickets', 'read'), async (req: AuthRequest, res) => {
