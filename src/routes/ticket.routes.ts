@@ -95,6 +95,23 @@ function slaForTicket(t: { priority: string; dueDate: Date | null; createdAt: Da
   };
 }
 
+const MASS_SYNC_STALE_MINUTES = 10;
+
+async function failStaleMassSyncJobs(): Promise<void> {
+  const cutoff = new Date(Date.now() - MASS_SYNC_STALE_MINUTES * 60 * 1000);
+  await prisma.externalSyncJob.updateMany({
+    where: {
+      status: { in: ['PENDING', 'PROCESSING'] },
+      updatedAt: { lt: cutoff },
+    },
+    data: {
+      status: 'FAILED',
+      error: `Marked failed automatically: no progress for ${MASS_SYNC_STALE_MINUTES}+ minutes`,
+      completedAt: new Date(),
+    },
+  });
+}
+
 const TicketSchema = z.object({
   projectId: z.string().uuid(),
   title: z.string().min(1).max(500),
@@ -161,6 +178,25 @@ router.post('/mass-sync', requirePermission('tickets', 'create'), async (req: Au
     return res.status(400).json({ error: { message: 'projectId, startId, and endId are required' } });
   }
 
+  await failStaleMassSyncJobs();
+
+  const activeJob = await prisma.externalSyncJob.findFirst({
+    where: { status: { in: ['PENDING', 'PROCESSING'] } },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (activeJob) {
+    // Re-trigger worker in case process restarted and in-memory loop was lost.
+    void massScraper.startSyncJob(activeJob.id);
+    return res.status(409).json({
+      success: false,
+      error: {
+        code: 'SYNC_JOB_ACTIVE',
+        message: `A sync job is already active (#${activeJob.currentId}/${activeJob.endId}). Please wait or retry after it updates.`,
+      },
+      data: activeJob,
+    });
+  }
+
   const job = await prisma.externalSyncJob.create({
     data: {
       projectId,
@@ -180,9 +216,20 @@ router.post('/mass-sync', requirePermission('tickets', 'create'), async (req: Au
 
 // GET /api/tickets/mass-sync/status
 router.get('/mass-sync/status', requirePermission('tickets', 'read'), async (req: AuthRequest, res) => {
-  const job = await prisma.externalSyncJob.findFirst({
-    orderBy: { createdAt: 'desc' }
-  });
+  await failStaleMassSyncJobs();
+
+  const job =
+    (await prisma.externalSyncJob.findFirst({
+      where: { status: { in: ['PENDING', 'PROCESSING'] } },
+      orderBy: { createdAt: 'desc' },
+    })) ??
+    (await prisma.externalSyncJob.findFirst({
+      orderBy: { createdAt: 'desc' },
+    }));
+
+  if (job && (job.status === 'PENDING' || job.status === 'PROCESSING')) {
+    void massScraper.startSyncJob(job.id);
+  }
 
   res.json({ success: true, data: job });
 });
@@ -193,7 +240,10 @@ router.get('/', requirePermission('tickets', 'read'), async (req: AuthRequest, r
     projectId, sprintId, assigneeIds, status, type, priority,
     search, page = '1', limit = '50', team
   } = req.query as Record<string, string>;
-  const skip = (parseInt(page) - 1) * parseInt(limit);
+  const limitNum = parseInt(String(limit), 10);
+  const take = Math.min(Math.max(Number.isFinite(limitNum) ? limitNum : 50, 1), 100);
+  const pageNum = Math.max(parseInt(String(page), 10) || 1, 1);
+  const skip = (pageNum - 1) * take;
 
   const where: any = { deletedAt: null };
   if (projectId) where.projectId = projectId;
@@ -242,12 +292,12 @@ router.get('/', requirePermission('tickets', 'read'), async (req: AuthRequest, r
       },
       orderBy: [{ createdAt: 'desc' }],
       skip,
-      take: parseInt(limit),
+      take,
     }),
     prisma.ticket.count({ where }),
   ]);
 
-  res.json({ success: true, data: { tickets, total, page: parseInt(page), limit: parseInt(limit) } });
+  res.json({ success: true, data: { tickets, total, page: pageNum, limit: take } });
 });
 
 /** Who can be assigned — all active users + projectMemberIds highlights project roster. */
