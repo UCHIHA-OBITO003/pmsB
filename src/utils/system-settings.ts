@@ -58,11 +58,19 @@ export async function setCodemagenEnabled(enabled: boolean): Promise<boolean> {
 export function codemagenTicketPredicate(): Prisma.TicketWhereInput {
   return {
     OR: [
-      { legacySourceKey: { startsWith: 'codemagen:' } },
+      {
+        AND: [
+          { legacySourceKey: { not: null } },
+          { legacySourceKey: { startsWith: 'codemagen:' } },
+        ],
+      },
       { source: 'codemagen_scraper' },
-      { sourceUrl: { contains: 'codemagen', mode: 'insensitive' } },
-      { company: { is: { name: { equals: CODEMAGEN_COMPANY_NAME, mode: 'insensitive' } } } },
-      { project: { is: { company: { is: { name: { equals: CODEMAGEN_COMPANY_NAME, mode: 'insensitive' } } } } } },
+      {
+        AND: [
+          { sourceUrl: { not: null } },
+          { sourceUrl: { contains: 'codemagen', mode: 'insensitive' } },
+        ],
+      },
     ],
   };
 }
