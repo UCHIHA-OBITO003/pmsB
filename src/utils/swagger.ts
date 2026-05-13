@@ -1,6 +1,7 @@
-import swaggerJsdoc from 'swagger-jsdoc';
+// Avoid loading large third-party type graphs during low-memory builds.
+const swaggerJsdoc: (options: any) => any = require('swagger-jsdoc');
 
-const options: swaggerJsdoc.Options = {
+const options = {
   definition: {
     openapi: '3.0.0',
     info: {

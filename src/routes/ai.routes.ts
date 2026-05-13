@@ -2,10 +2,12 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { prisma } from '../utils/prisma';
 import { authenticate, requirePermission } from '../middleware/auth';
-import Anthropic from '@anthropic-ai/sdk';
-import OpenAI from 'openai';
 import { config } from '../utils/config';
 import { AppError } from '../middleware/errorHandler';
+
+// Use runtime requires here to keep deploy-time type memory down on Render.
+const Anthropic = require('@anthropic-ai/sdk').default as any;
+const OpenAI = require('openai').default as any;
 
 const router = Router();
 router.use(authenticate);

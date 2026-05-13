@@ -1,6 +1,7 @@
 import ExcelJS from 'exceljs';
 import crypto from 'crypto';
-import { google } from 'googleapis';
+// Avoid pulling the full googleapis declaration graph into tsc on tiny build machines.
+const { google }: { google: any } = require('googleapis');
 import { STATUS_MAP, PRIORITY_MAP } from '../utils/mappings';
 import { prisma } from '../utils/prisma';
 import { resolveOrCreateDeveloperFromAssignee } from '../utils/assignee-import-user';
@@ -55,7 +56,7 @@ export const excelImportService = {
     const [rawHeaders, ...rows] = values;
     const headers: string[] = (rawHeaders || []).map(String);
 
-    const preview = rows.slice(0, maxRows).map((row) => {
+    const preview = rows.slice(0, maxRows).map((row: any[]) => {
       const obj: Record<string, string> = {};
       headers.forEach((h, i) => { obj[h] = String(row[i] || ''); });
       return obj;
