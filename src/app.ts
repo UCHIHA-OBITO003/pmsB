@@ -48,11 +48,16 @@ app.use(
         callback(null, true);
         return;
       }
-      if (config.corsOrigins.includes(origin)) {
+      if (config.corsAllowAll) {
         callback(null, true);
         return;
       }
-      logger.warn({ origin, allowedOrigins: config.corsOrigins }, 'CORS origin not allowed');
+      const normalizedOrigin = origin.replace(/\/$/, '');
+      if (config.corsOrigins.includes(normalizedOrigin)) {
+        callback(null, true);
+        return;
+      }
+      logger.warn({ origin, allowedOrigins: config.corsOrigins, allowAll: config.corsAllowAll }, 'CORS origin not allowed');
       callback(null, false);
     },
     credentials: true,

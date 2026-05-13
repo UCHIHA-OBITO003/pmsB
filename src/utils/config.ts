@@ -1,6 +1,14 @@
 import dotenv from 'dotenv';
 dotenv.config();
 
+function envFlag(raw: string | undefined): boolean {
+  return /^(1|true|yes|on)$/i.test((raw || '').trim());
+}
+
+function normalizeOrigin(raw: string): string {
+  return raw.trim().replace(/^['"]|['"]$/g, '').replace(/\/$/, '');
+}
+
 /** Upstash / Render: paste only `rediss://...` or `redis://...`, not `redis-cli --tls -u ...` */
 function normalizeRedisUrl(raw: string | undefined): string {
   const fallback = 'redis://localhost:6379';
@@ -23,8 +31,15 @@ export const config = {
   nodeEnv: process.env.NODE_ENV || 'development',
   corsOrigins: (process.env.CORS_ORIGINS || 'http://localhost:5173')
     .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
+    .map((s) => normalizeOrigin(s))
+    .filter((s) => Boolean(s) && s !== '*'),
+  /** When true, reflect any browser Origin (works with credentials; less safe for production). */
+  corsAllowAll:
+    envFlag(process.env.CORS_ALLOW_ALL) ||
+    (process.env.CORS_ORIGINS || '')
+      .split(',')
+      .map((s) => normalizeOrigin(s))
+      .includes('*'),
 
   jwt: {
     secret: process.env.JWT_SECRET || 'dev-secret-change-in-prod',
