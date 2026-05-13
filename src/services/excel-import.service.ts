@@ -9,6 +9,7 @@ import { config } from '../utils/config';
 import { logger } from '../utils/logger';
 import { parseLegacyTicketSource } from '../utils/legacy-source-url';
 import { resolveLegacyTicketProjectId } from '../utils/legacy-project';
+import { getCodemagenEnabled } from '../utils/system-settings';
 
 // ─── Google Auth Helper ──────────────────────────────────────────────────────
 
@@ -144,6 +145,7 @@ export const excelImportService = {
     sheetOptions?: { legacyTicketProjectId?: string | null },
   ) {
     const start = Date.now();
+    const codemagenEnabled = await getCodemagenEnabled();
     logger.info({ sheetId, projectId }, 'Starting Google Sheet sync');
 
     const auth = await getGoogleAuth();
@@ -242,6 +244,10 @@ export const excelImportService = {
       const { legacySourceKey, canonicalUrl, issueNumber } = parseLegacyTicketSource(sourceCell);
       const resolvedSourceUrl = canonicalUrl || (shortUrl ? shortUrl : null);
       const isCodemagenLegacy = !!(legacySourceKey && legacySourceKey.startsWith('codemagen:'));
+      if (isCodemagenLegacy && !codemagenEnabled) {
+        skipped++;
+        continue;
+      }
       const effectiveProjectId = isCodemagenLegacy && legacyProj ? legacyProj.id : projectId;
 
       if (isCodemagenLegacy && legacyProj && legacyProj.id !== projectId) {

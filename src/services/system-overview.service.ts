@@ -2,6 +2,7 @@ import os from 'os';
 import { prisma } from '../utils/prisma';
 import { redis } from '../utils/redis';
 import { config } from '../utils/config';
+import { getCodemagenEnabled } from '../utils/system-settings';
 import { smtpCredentialsPresent } from './email.service';
 import { CRON_MANIFEST } from '../crons/definitions';
 import { getApiHitsSnapshot } from '../utils/api-request-metrics';
@@ -76,6 +77,7 @@ export async function buildSystemOverview() {
   }
 
   const dbFootprint = await postgresDbFootprint();
+  const codemagenEnabled = await getCodemagenEnabled();
 
   let externalSyncJobsByStatus: Record<string, number> = {};
   try {
@@ -147,6 +149,11 @@ export async function buildSystemOverview() {
           metrics: null,
           note: 'Queue metrics unavailable — Redis may not be connected yet.',
         },
+    featureFlags: {
+      codemagenEnabled,
+      codemagenNote:
+        'Redis-backed global toggle. Off = Codemagen tickets/users stay hidden and new Codemagen ingestion/sync endpoints reject requests.',
+    },
     infrastructureNote:
       'VRAM-style limits and egress charts remain in Render / host dashboards — here you see process-visible memory plus DB/Redis pings.',
   };

@@ -1,6 +1,7 @@
 import bcrypt from 'bcryptjs';
 import { prisma } from './prisma';
 import { resolveUserAlias, isHanzDeveloper } from './user-mapping';
+import { getCodemagenEnabled } from './system-settings';
 
 /** Ensures the user has the system `developer` role (upsert). */
 export async function ensureUserHasDeveloperRole(userId: string): Promise<void> {
@@ -61,10 +62,17 @@ export async function findUserForAssigneeImportName(normalizedName: string) {
 export async function resolveOrCreateDeveloperFromAssignee(rawName: string) {
   const name = resolveUserAlias(rawName).trim();
   if (!name) return null;
+  const codemagenEnabled = await getCodemagenEnabled();
 
   let user = await findUserForAssigneeImportName(name);
+  if (user && !codemagenEnabled && user.department?.toLowerCase() === 'codemagen') {
+    return null;
+  }
 
   if (!user) {
+    if (!codemagenEnabled && !isHanzDeveloper(name)) {
+      return null;
+    }
     const slug = name.toLowerCase().replace(/[^a-z0-9]/g, '') || 'user';
     const email = `${slug}@pms.local`;
     const hash = await bcrypt.hash('Dev@123456', 10);

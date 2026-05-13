@@ -1,6 +1,8 @@
 import { Router } from 'express';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '../utils/prisma';
 import { authenticate, requirePermission } from '../middleware/auth';
+import { applyCodemagenUserVisibility, getCodemagenEnabled } from '../utils/system-settings';
 
 const router = Router();
 router.use(authenticate);
@@ -8,8 +10,9 @@ router.use(authenticate);
 // GET /api/analytics/users
 router.get('/users', requirePermission('analytics', 'read'), async (req, res) => {
   const { projectId } = req.query as { projectId?: string };
-  const where: any = {};
+  const where: Prisma.UserWhereInput = {};
   if (projectId) where.projectMemberships = { some: { projectId } };
+  applyCodemagenUserVisibility(where, await getCodemagenEnabled());
 
   const users = await prisma.user.findMany({
     where,

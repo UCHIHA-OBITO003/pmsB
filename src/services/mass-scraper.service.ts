@@ -5,11 +5,13 @@ import { STATUS_MAP, PRIORITY_MAP } from '../utils/mappings';
 import { logger } from '../utils/logger';
 import { config } from '../utils/config';
 import { parseLegacyTicketSource } from '../utils/legacy-source-url';
+import { assertCodemagenEnabled } from '../utils/system-settings';
 
 export class MassScraperService {
   private activeJobs: Map<string, boolean> = new Map();
 
   async startSyncJob(jobId: string) {
+    await assertCodemagenEnabled('start Codemagen extraction');
     if (this.activeJobs.get(jobId)) return;
     this.activeJobs.set(jobId, true);
 

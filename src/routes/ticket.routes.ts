@@ -22,6 +22,12 @@ import {
 } from '../services/legacy-ticket-remediation.service';
 import { legacyPatchFromConverted, performLegacyCodemagenSync } from '../services/legacy-sync.service';
 import { enqueueLegacySyncJobs } from '../queues/index';
+import {
+  applyCodemagenTicketVisibility,
+  applyCodemagenUserVisibility,
+  assertCodemagenEnabled,
+  getCodemagenEnabled,
+} from '../utils/system-settings';
 
 const router = Router();
 router.use(authenticate);
@@ -101,6 +107,7 @@ const TicketSchema = z.object({
 
 // POST /api/tickets/sync-external
 router.post('/sync-external', requirePermission('tickets', 'update'), async (req, res) => {
+  await assertCodemagenEnabled('start external Codemagen sync');
   const { projectId } = req.body as { projectId?: string };
   
   const where: any = { sourceUrl: { not: null }, deletedAt: null };
@@ -141,6 +148,7 @@ router.post('/sync-external', requirePermission('tickets', 'update'), async (req
 
 // POST /api/tickets/mass-sync
 router.post('/mass-sync', requirePermission('tickets', 'create'), async (req: AuthRequest, res) => {
+  await assertCodemagenEnabled('start Codemagen extraction');
   const { projectId, startId, endId } = req.body;
 
   if (!projectId || !startId || !endId) {
@@ -225,8 +233,10 @@ router.get('/', requirePermission('tickets', 'read'), async (req: AuthRequest, r
   const take = Math.min(Math.max(Number.isFinite(limitNum) ? limitNum : 50, 1), TICKET_LIST_MAX_LIMIT);
   const pageNum = Math.max(parseInt(String(page), 10) || 1, 1);
   const skip = (pageNum - 1) * take;
+  const codemagenEnabled = await getCodemagenEnabled();
 
   const where: Prisma.TicketWhereInput = { deletedAt: null };
+  applyCodemagenTicketVisibility(where, codemagenEnabled);
   if (projectId) where.projectId = projectId;
   if (sprintId) where.sprintId = sprintId;
   if (type) where.type = type as TicketType;
@@ -313,6 +323,7 @@ router.get('/', requirePermission('tickets', 'read'), async (req: AuthRequest, r
 
 /** Who can be assigned — all active users + projectMemberIds highlights project roster. */
 router.get('/assignment-candidates', requirePermission('tickets', 'read'), async (req: AuthRequest, res) => {
+  const codemagenEnabled = await getCodemagenEnabled();
   const ticketIdRaw = req.query.ticketId;
   const projectIdRaw = req.query.projectId;
   const ticketId =
@@ -355,8 +366,11 @@ router.get('/assignment-candidates', requirePermission('tickets', 'read'), async
   });
   const projectMemberIds = new Set(memberRows.map((r) => r.userId));
 
+  const candidateWhere: Prisma.UserWhereInput = { deletedAt: null, status: 'ACTIVE' };
+  applyCodemagenUserVisibility(candidateWhere, codemagenEnabled);
+
   const all = await prisma.user.findMany({
-    where: { deletedAt: null, status: 'ACTIVE' },
+    where: candidateWhere,
     select: { id: true, firstName: true, lastName: true, email: true, avatar: true },
     orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }],
     take: 1000,
@@ -392,11 +406,13 @@ router.get('/assignment-candidates', requirePermission('tickets', 'read'), async
 
 /** Typical module/screen/tag/title values for datalist suggestions in the UI. */
 router.get('/form-suggestions', requirePermission('tickets', 'read'), async (req: AuthRequest, res) => {
+  const codemagenEnabled = await getCodemagenEnabled();
   const projectIdRaw = req.query.projectId;
   const projectId =
     typeof projectIdRaw === 'string' && projectIdRaw.trim().length > 0 ? projectIdRaw.trim() : undefined;
 
-  const baseWhere: { deletedAt: null; projectId?: string } = { deletedAt: null };
+  const baseWhere: Prisma.TicketWhereInput = { deletedAt: null };
+  applyCodemagenTicketVisibility(baseWhere, codemagenEnabled);
   if (projectId) baseWhere.projectId = projectId;
 
   const [withModule, withScreen, titleRows, tagRows] = await Promise.all([
@@ -457,6 +473,9 @@ router.get('/form-suggestions', requirePermission('tickets', 'read'), async (req
 
 /** Dropdown data for ticket list filters (accessible with tickets:read). */
 router.get('/filter-options', requirePermission('tickets', 'read'), async (_req: AuthRequest, res) => {
+  const codemagenEnabled = await getCodemagenEnabled();
+  const activeUserWhere: Prisma.UserWhereInput = { deletedAt: null, status: 'ACTIVE' };
+  applyCodemagenUserVisibility(activeUserWhere, codemagenEnabled);
   const [projects, companies, organisations, activeUsers] = await Promise.all([
     prisma.project.findMany({
       where: { deletedAt: null },
@@ -476,13 +495,13 @@ router.get('/filter-options', requirePermission('tickets', 'read'), async (_req:
       take: 200,
     }),
     prisma.user.findMany({
-      where: { deletedAt: null, status: 'ACTIVE' },
+      where: activeUserWhere,
       select: { id: true, firstName: true, lastName: true, email: true },
       orderBy: [{ firstName: 'asc' }, { lastName: 'asc' }],
       take: 800,
     }),
   ]);
-  res.json({ success: true, data: { projects, companies, organisations, users: activeUsers } });
+  res.json({ success: true, data: { projects, companies, organisations, users: activeUsers, codemagenEnabled } });
 });
 
 router.get('/ticket-templates', requirePermission('tickets', 'read'), async (req: AuthRequest, res) => {
@@ -563,6 +582,7 @@ router.post(
 
 // POST /api/tickets/admin-remediate-legacy — move Codemagen/sheet rows + backfill keys (admin)
 router.post('/admin-remediate-legacy', requireRole('admin'), async (req, res) => {
+  await assertCodemagenEnabled('run legacy remediation');
   const body = z
     .object({
       targetProjectKey: z.string().min(1).default('EEP'),
@@ -601,6 +621,7 @@ router.post('/admin-dedupe-legacy', requireRole('admin'), async (req, res) => {
 
 // POST /api/tickets/admin-enqueue-legacy-sync-all — queue Codemagen re-scrape for all eligible tickets (admin)
 router.post('/admin-enqueue-legacy-sync-all', requireRole('admin'), async (req, res) => {
+  await assertCodemagenEnabled('queue legacy refresh jobs');
   const body = z
     .object({
       limit: z.coerce.number().min(1).max(50_000).optional(),
@@ -633,6 +654,7 @@ router.post('/admin-enqueue-legacy-sync-all', requireRole('admin'), async (req, 
 
 // POST /api/tickets/:id/sync-legacy — re-scrape Redmine/Codemagen and merge metadata + core fields
 router.post('/:id/sync-legacy', requirePermission('tickets', 'update'), async (req: AuthRequest, res) => {
+  await assertCodemagenEnabled('refresh legacy ticket data');
   const whereLookup: Prisma.TicketWhereInput = { id: req.params.id, deletedAt: null };
   applyTicketParticipantScope(whereLookup, req.user!.id, req.user!.roles);
   const existing = await prisma.ticket.findFirst({
@@ -654,6 +676,7 @@ router.post('/:id/sync-legacy', requirePermission('tickets', 'update'), async (r
 // GET /api/tickets/:id
 router.get('/:id', requirePermission('tickets', 'read'), async (req: AuthRequest, res) => {
   const whereTicket: Prisma.TicketWhereInput = { id: req.params.id, deletedAt: null };
+  applyCodemagenTicketVisibility(whereTicket, await getCodemagenEnabled());
   applyTicketParticipantScope(whereTicket, req.user!.id, req.user!.roles);
 
   const ticket = await prisma.ticket.findFirst({

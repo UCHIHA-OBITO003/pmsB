@@ -4,6 +4,7 @@ import { redmineScraper } from './redmine-scraper.service';
 import { PRIORITY_MAP } from '../utils/mappings';
 import type { TicketPriority } from '@prisma/client';
 import { parseLegacyTicketSource } from '../utils/legacy-source-url';
+import { assertCodemagenEnabled } from '../utils/system-settings';
 
 /** Map Redmine JSON `converted` blob onto Prisma ticket fields (description, priority, dates, estimate). */
 export function legacyPatchFromConverted(converted: Record<string, unknown>): Prisma.TicketUpdateInput {
@@ -49,6 +50,7 @@ export function parseEstimatedHoursFromLegacy(val: unknown): number | undefined 
  * Used by BullMQ worker and can be wrapped by HTTP handlers that enforce access.
  */
 export async function performLegacyCodemagenSync(ticketId: string): Promise<void> {
+  await assertCodemagenEnabled('refresh legacy ticket data');
   const existing = await prisma.ticket.findFirst({
     where: { id: ticketId, deletedAt: null },
     select: { id: true, sourceUrl: true },

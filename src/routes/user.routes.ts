@@ -9,6 +9,7 @@ import { sendWelcomeCredentialsEmail, sendAdminProfileNotificationEmail } from '
 import { mergeUsersIntoTarget } from '../services/user-merge.service';
 import { emailDeliveryForClient, smtpCredentialsPresent, EmailSendResult } from '../services/email.service';
 import { logger } from '../utils/logger';
+import { applyCodemagenUserVisibility, getCodemagenEnabled } from '../utils/system-settings';
 
 type UserRowPlain = NonNullable<Awaited<ReturnType<typeof prisma.user.findFirst>>>;
 
@@ -197,6 +198,7 @@ router.get('/', requirePermission('users', 'read'), async (req, res) => {
 
   // showArchived=true → only tombstoned users; default → only active rows
   const where: any = showArchived === 'true' ? { NOT: { deletedAt: null } } : { deletedAt: null };
+  applyCodemagenUserVisibility(where, await getCodemagenEnabled());
   if (search) {
     where.OR = [
       { firstName: { contains: search, mode: 'insensitive' } },
