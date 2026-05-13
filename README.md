@@ -1,49 +1,46 @@
 # pmsB (backend API)
 
-## Deploy on Render (512 MiB–friendly)
+## Why deploy “worked before” on the same plan but fails now
 
-**What was going wrong:** a full monorepo `pnpm install` at the repo root installs **frontend + backend + shared**, which often exceeds **512 MiB RAM** during install on Render Starter.
+On Render, **Starter / free-style limits are usually RAM (memory), not disk “storage.”** Builds spike RAM during `npm install`, Prisma generate, and TypeScript compile. The instance size in MB can stay the same while **your app stops fitting** because:
 
-**Root directory:** repository root (where `pnpm-lock.yaml` and `pnpm-workspace.yaml` live). Do **not** set Root Directory to `backend` unless you introduce a separate lockfile there.
+1. **More or heavier dependencies** — e.g. **Puppeteer** (in `package.json`) runs install-time browser downloads and uses a lot of RAM/disk even if you never `import` it yet.
+2. **Different repo layout than the docs** — Commands that assume a **pnpm monorepo** (`pnpm run render:build:api`, root `pnpm-workspace.yaml`) only work in that layout. **This repo (`pmsB`) is standalone** (no workspace, no root `render:build:api`). Using monorepo build lines here fails immediately.
 
-### Recommended build command (dashboard or Blueprint)
+---
 
-Use a **filtered** install so only the backend dependency graph is linked (skips the Vite/React frontend tree):
+## Deploy this repo (`pmsB`) on Render (512 MiB–friendly)
+
+**Root directory:** `.` (repository root — same folder as this `README.md` and `package.json`).
+
+**Build command** (skip Puppeteer’s browser download to save RAM/time; adjust if you truly need bundled Chrome on the dyno):
 
 ```bash
 export NODE_OPTIONS="--max-old-space-size=384"
-export PNPM_NETWORK_CONCURRENCY=2
-corepack enable && corepack prepare pnpm@9.15.0 --activate
-pnpm run render:build:api
+export PUPPETEER_SKIP_DOWNLOAD=true
+npm install
+npx prisma generate
+npm run build
 ```
 
-Or as a **single line** (matches [render.yaml](../render.yaml) `buildCommand`):
+**Start command:**
 
 ```bash
-export NODE_OPTIONS="--max-old-space-size=384" && export PNPM_NETWORK_CONCURRENCY=2 && corepack enable && corepack prepare pnpm@9.15.0 --activate && pnpm run render:build:api
+npm run start
 ```
 
-`render:build:api` is defined in the **root** [package.json](../package.json) as:
+**Health check path:** `/health` (or whatever you expose publicly).
 
-`pnpm install --frozen-lockfile --filter backend... && pnpm --filter backend run db:generate && pnpm --filter backend run build`
+**Port:** Render sets `PORT`; the app uses `process.env.PORT` (see `src/utils/config.ts`).
 
-### Start command
+### If the build still OOMs or is killed
 
-```bash
-pnpm --filter backend start
-```
+1. Bump the service to **≥ 1 GiB RAM** (most reliable).
+2. Lower Node heap slightly only if installs succeed but `tsc` dies: e.g. `--max-old-space-size=320` — too low breaks the build.
+3. Commit a **`package-lock.json`** (`npm install` locally, commit the lockfile) so every deploy installs the same versions and avoids surprise resolver work.
 
-Runs `node dist/index.js` from [package.json](./package.json).
+---
 
-### Port / health
+## Optional: same machine layout as a pnpm monorepo
 
-Render injects **`PORT`**. The API reads it in [src/utils/config.ts](./src/utils/config.ts) (`process.env.PORT || '3001'`). Set your Render health check path to `/health` (or your public health route).
-
-### If install still OOMs
-
-1. Upgrade the instance to **≥ 1 GiB RAM** (most reliable).
-2. Tighten further: `PNPM_NETWORK_CONCURRENCY=1` and/or lower `--max-old-space-size` slightly (must stay enough for `tsc` + `prisma generate`).
-
-### Blueprint file
-
-Repo root [render.yaml](../render.yaml) wires the same build/start pattern for **Blueprint** deploys. Adjust `region` / `plan` / `name` as needed.
+If you deploy from a **single repository** that contains `frontend/`, `backend/`, `shared/`, root `pnpm-lock.yaml`, and root `package.json` with script `render:build:api`, use the filtered install documented there (or root `render.yaml`). **Do not** point Render at this `pmsB` repo and use those commands — they will not exist here.
