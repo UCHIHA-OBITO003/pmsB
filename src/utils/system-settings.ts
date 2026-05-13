@@ -6,6 +6,8 @@ import { logger } from './logger';
 const CODEMAGEN_ENABLED_KEY = 'settings:codemagen:enabled';
 const DEFAULT_CODEMAGEN_ENABLED = false;
 const CACHE_TTL_MS = 5_000;
+const CODEMAGEN_COMPANY_NAME = 'Codemagen';
+const HANZ_COMPANY_NAME = 'Hanz';
 
 let codemagenEnabledCache = DEFAULT_CODEMAGEN_ENABLED;
 let cacheExpiresAt = 0;
@@ -59,6 +61,8 @@ export function codemagenTicketPredicate(): Prisma.TicketWhereInput {
       { legacySourceKey: { startsWith: 'codemagen:' } },
       { source: 'codemagen_scraper' },
       { sourceUrl: { contains: 'codemagen', mode: 'insensitive' } },
+      { company: { is: { name: { equals: CODEMAGEN_COMPANY_NAME, mode: 'insensitive' } } } },
+      { project: { is: { company: { is: { name: { equals: CODEMAGEN_COMPANY_NAME, mode: 'insensitive' } } } } } },
     ],
   };
 }
@@ -94,6 +98,27 @@ export function filterVisibleMembershipUsers<T extends { user?: { department?: s
 ): T[] {
   if (codemagenEnabled) return rows;
   return rows.filter((row) => isVisibleUserDepartment(row.user?.department, codemagenEnabled));
+}
+
+export function getTicketCompanyLabel(ticket: {
+  legacySourceKey?: string | null;
+  source?: string | null;
+  sourceUrl?: string | null;
+  company?: { name?: string | null } | null;
+  project?: { company?: { name?: string | null } | null } | null;
+}): string {
+  const directCompanyName = ticket.company?.name?.trim();
+  if (directCompanyName) return directCompanyName;
+
+  const projectCompanyName = ticket.project?.company?.name?.trim();
+  if (projectCompanyName) return projectCompanyName;
+
+  const isCodemagenTicket =
+    ticket.legacySourceKey?.startsWith('codemagen:') ||
+    ticket.source === 'codemagen_scraper' ||
+    /codemagen/i.test(ticket.sourceUrl ?? '');
+
+  return isCodemagenTicket ? CODEMAGEN_COMPANY_NAME : HANZ_COMPANY_NAME;
 }
 
 export async function assertCodemagenEnabled(action = 'use Codemagen data'): Promise<void> {

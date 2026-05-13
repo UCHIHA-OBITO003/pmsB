@@ -26,10 +26,17 @@ const ProjectSchema = z.object({
   status: z.enum(['ACTIVE', 'ON_HOLD', 'COMPLETED', 'CANCELLED', 'PLANNING']).optional(),
 });
 
+async function countVisibleTickets(projectId: string, codemagenEnabled: boolean): Promise<number> {
+  const where: Prisma.TicketWhereInput = { projectId, deletedAt: null };
+  applyCodemagenTicketVisibility(where, codemagenEnabled);
+  return prisma.ticket.count({ where });
+}
+
 // GET /api/projects
 router.get('/', requirePermission('projects', 'read'), async (req: AuthRequest, res) => {
   const { search, status, page = '1', limit = '20' } = req.query as Record<string, string>;
   const skip = (parseInt(page) - 1) * parseInt(limit);
+  const codemagenEnabled = await getCodemagenEnabled();
 
   const where: any = { deletedAt: null };
 
@@ -58,7 +65,23 @@ router.get('/', requirePermission('projects', 'read'), async (req: AuthRequest, 
     prisma.project.count({ where }),
   ]);
 
-  res.json({ success: true, data: { projects, total, page: parseInt(page), limit: parseInt(limit) } });
+  const visibleTicketCounts = await Promise.all(projects.map((project) => countVisibleTickets(project.id, codemagenEnabled)));
+
+  res.json({
+    success: true,
+    data: {
+      projects: projects.map((project, index) => ({
+        ...project,
+        _count: {
+          ...project._count,
+          tickets: visibleTicketCounts[index],
+        },
+      })),
+      total,
+      page: parseInt(page),
+      limit: parseInt(limit),
+    },
+  });
 });
 
 // GET /api/projects/:id
@@ -91,10 +114,15 @@ router.get('/:id', requirePermission('projects', 'read'), async (req, res) => {
   });
 
   if (!project) throw new AppError(404, 'Project not found', 'NOT_FOUND');
+  const visibleTicketCount = await countVisibleTickets(project.id, codemagenEnabled);
   res.json({
     success: true,
     data: {
       ...project,
+      _count: {
+        ...project._count,
+        tickets: visibleTicketCount,
+      },
       members: filterVisibleMembershipUsers(project.members, codemagenEnabled),
     },
   });

@@ -27,6 +27,7 @@ import {
   applyCodemagenUserVisibility,
   assertCodemagenEnabled,
   filterVisibleUsers,
+  getTicketCompanyLabel,
   getCodemagenEnabled,
 } from '../utils/system-settings';
 
@@ -71,6 +72,14 @@ function slaForTicket(t: { priority: string; dueDate: Date | null; createdAt: Da
 const MASS_SYNC_STALE_MINUTES = 10;
 /** Hard cap for GET /api/tickets page size — large payloads; prefer filters + paging when possible */
 const TICKET_LIST_MAX_LIMIT = 25_000;
+
+async function getProjectCompanyId(projectId: string): Promise<string | null> {
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    select: { companyId: true },
+  });
+  return project?.companyId ?? null;
+}
 
 async function failStaleMassSyncJobs(): Promise<void> {
   const cutoff = new Date(Date.now() - MASS_SYNC_STALE_MINUTES * 60 * 1000);
@@ -308,7 +317,14 @@ router.get('/', requirePermission('tickets', 'read'), async (req: AuthRequest, r
         assignees: { select: { id: true, firstName: true, lastName: true, avatar: true, department: true } },
         reporter: { select: { id: true, firstName: true, lastName: true } },
         workflowState: true,
-        project: { select: { id: true, name: true, key: true } },
+        project: {
+          select: {
+            id: true,
+            name: true,
+            key: true,
+            company: { select: { id: true, name: true, organisationId: true } },
+          },
+        },
         company: { select: { id: true, name: true, organisationId: true } },
         _count: { select: { comments: true, attachments: true, children: true } },
       },
@@ -325,6 +341,7 @@ router.get('/', requirePermission('tickets', 'read'), async (req: AuthRequest, r
       tickets: tickets.map((ticket) => ({
         ...ticket,
         assignees: filterVisibleUsers(ticket.assignees, codemagenEnabled),
+        companyLabel: getTicketCompanyLabel(ticket),
       })),
       total,
       page: pageNum,
@@ -566,13 +583,17 @@ router.post(
         ? (rawPri as 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL')
         : 'MEDIUM';
 
-    const defaultState = await prisma.workflowState.findFirst({
-      where: { projectId: tpl.projectId, isDefault: true },
-    });
+    const [defaultState, projectCompanyId] = await Promise.all([
+      prisma.workflowState.findFirst({
+        where: { projectId: tpl.projectId, isDefault: true },
+      }),
+      getProjectCompanyId(tpl.projectId),
+    ]);
 
     const ticket = await prisma.ticket.create({
       data: {
         projectId: tpl.projectId,
+        companyId: projectCompanyId ?? undefined,
         title,
         description,
         type,
@@ -700,7 +721,14 @@ router.get('/:id', requirePermission('tickets', 'read'), async (req: AuthRequest
       },
       reporter: { select: { id: true, firstName: true, lastName: true } },
       workflowState: true,
-      project: { select: { id: true, name: true, key: true } },
+      project: {
+        select: {
+          id: true,
+          name: true,
+          key: true,
+          company: { select: { id: true, name: true, organisationId: true } },
+        },
+      },
       company: { select: { id: true, name: true, organisationId: true } },
       sprint: { select: { id: true, name: true, status: true } },
       comments: {
@@ -746,6 +774,7 @@ router.get('/:id', requirePermission('tickets', 'read'), async (req: AuthRequest
         assignees: filterVisibleUsers(child.assignees, codemagenEnabled),
       })),
       watchers: ticket.watchers.filter((watcher) => !watcher.user || filterVisibleUsers([watcher.user], codemagenEnabled).length > 0),
+      companyLabel: getTicketCompanyLabel(ticket),
       sla,
     },
   });
@@ -755,16 +784,19 @@ router.get('/:id', requirePermission('tickets', 'read'), async (req: AuthRequest
 router.post('/', requirePermission('tickets', 'create'), async (req: AuthRequest, res) => {
   const { assigneeIds, ...data } = TicketSchema.parse(req.body);
 
-  // Get default workflow state for project
-  const defaultState = await prisma.workflowState.findFirst({
-    where: { projectId: data.projectId, isDefault: true },
-  });
+  const [defaultState, projectCompanyId] = await Promise.all([
+    prisma.workflowState.findFirst({
+      where: { projectId: data.projectId, isDefault: true },
+    }),
+    data.companyId === undefined ? getProjectCompanyId(data.projectId) : Promise.resolve(null),
+  ]);
 
   const ticket = await prisma.ticket.create({
     data: {
       ...data,
       reporterId: req.user!.id,
       workflowStateId: defaultState?.id,
+      companyId: data.companyId === undefined ? projectCompanyId ?? undefined : data.companyId,
       assignees: assigneeIds ? { connect: assigneeIds.map(id => ({ id })) } : undefined,
     },
   });
