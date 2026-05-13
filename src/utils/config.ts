@@ -18,6 +18,7 @@ function normalizeRedisUrl(raw: string | undefined): string {
 }
 
 export const config = {
+  /** Render and other hosts set `PORT`; local default 3001. */
   port: parseInt(process.env.PORT || '3001'),
   nodeEnv: process.env.NODE_ENV || 'development',
   corsOrigins: (process.env.CORS_ORIGINS || 'http://localhost:5173')
