@@ -79,7 +79,28 @@ export function applyCodemagenUserVisibility(
   mergeAnd(where, { NOT: { department: { equals: 'Codemagen', mode: 'insensitive' } } });
 }
 
+export function isVisibleUserDepartment(department: string | null | undefined, codemagenEnabled: boolean): boolean {
+  return codemagenEnabled || !department || department.toLowerCase() !== 'codemagen';
+}
+
+export function filterVisibleUsers<T extends { department?: string | null }>(rows: T[], codemagenEnabled: boolean): T[] {
+  if (codemagenEnabled) return rows;
+  return rows.filter((row) => isVisibleUserDepartment(row.department, codemagenEnabled));
+}
+
+export function filterVisibleMembershipUsers<T extends { user?: { department?: string | null } | null }>(
+  rows: T[],
+  codemagenEnabled: boolean,
+): T[] {
+  if (codemagenEnabled) return rows;
+  return rows.filter((row) => isVisibleUserDepartment(row.user?.department, codemagenEnabled));
+}
+
 export async function assertCodemagenEnabled(action = 'use Codemagen data'): Promise<void> {
   if (await getCodemagenEnabled()) return;
-  throw new AppError(409, `Codemagen integration is disabled. Enable it in Admin -> System to ${action}.`, 'CODEMAGEN_DISABLED');
+  throw new AppError(
+    409,
+    `Legacy Codemagen data is hidden. Enable it in Admin -> System to ${action}.`,
+    'CODEMAGEN_DISABLED',
+  );
 }

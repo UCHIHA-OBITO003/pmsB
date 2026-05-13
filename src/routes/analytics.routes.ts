@@ -2,7 +2,12 @@ import { Router } from 'express';
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../utils/prisma';
 import { authenticate, requirePermission } from '../middleware/auth';
-import { applyCodemagenUserVisibility, getCodemagenEnabled } from '../utils/system-settings';
+import {
+  applyCodemagenTicketVisibility,
+  applyCodemagenUserVisibility,
+  filterVisibleUsers,
+  getCodemagenEnabled,
+} from '../utils/system-settings';
 
 const router = Router();
 router.use(authenticate);
@@ -118,17 +123,21 @@ router.get('/project/:id', requirePermission('analytics', 'read'), async (req, r
 router.get('/workload-heatmap', requirePermission('analytics', 'read'), async (req, res) => {
   const { projectId } = req.query as { projectId?: string };
   const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+  const codemagenEnabled = await getCodemagenEnabled();
 
   const snapshots = await prisma.workloadSnapshot.findMany({
     where: {
       ...(projectId ? { projectId } : {}),
       date: { gte: since },
     },
-    include: { user: { select: { firstName: true, lastName: true } } },
+    include: { user: { select: { firstName: true, lastName: true, department: true } } },
     orderBy: [{ date: 'asc' }, { userId: 'asc' }],
   });
 
-  res.json({ success: true, data: snapshots });
+  res.json({
+    success: true,
+    data: snapshots.filter((row) => filterVisibleUsers([row.user], codemagenEnabled).length > 0),
+  });
 });
 
 // GET /api/analytics/tickets
@@ -136,11 +145,13 @@ router.get('/tickets', requirePermission('analytics', 'read'), async (req, res) 
   const { projectId, period = '30d' } = req.query as { projectId?: string; period?: string };
   const days = period === '7d' ? 7 : period === '30d' ? 30 : period === '90d' ? 90 : period === '6m' ? 180 : period === '1y' ? 365 : 3650;
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const codemagenEnabled = await getCodemagenEnabled();
 
-  const where: any = {
+  const where: Prisma.TicketWhereInput = {
     deletedAt: null,
-    createdAt: { gte: since }
+    createdAt: { gte: since },
   };
+  applyCodemagenTicketVisibility(where, codemagenEnabled);
   if (projectId) where.projectId = projectId;
 
   const tickets = await prisma.ticket.findMany({
@@ -188,8 +199,16 @@ router.get('/tickets', requirePermission('analytics', 'read'), async (req, res) 
 
 router.get('/leaderboard', requirePermission('analytics', 'read'), async (req, res) => {
   const { department, limit = '25' } = req.query as { department?: string; limit?: string };
-  const where: { user?: { department?: string } } = {};
-  if (department) where.user = { department };
+  const codemagenEnabled = await getCodemagenEnabled();
+  const where: { user?: Prisma.UserWhereInput } = {};
+  if (department || !codemagenEnabled) {
+    const userWhere: Prisma.UserWhereInput[] = [];
+    if (department) userWhere.push({ department });
+    if (!codemagenEnabled) {
+      userWhere.push({ department: { not: 'Codemagen' } });
+    }
+    where.user = userWhere.length === 1 ? userWhere[0] : { AND: userWhere };
+  }
 
   const scores = await prisma.developerScorecard.findMany({
     where,
@@ -209,10 +228,12 @@ router.get('/velocity', requirePermission('analytics', 'read'), async (req, res)
   };
   const days = Math.min(Math.max(parseInt(daysStr) || 30, 1), 365);
   const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const codemagenEnabled = await getCodemagenEnabled();
 
-  const where: Record<string, unknown> = { deletedAt: null };
+  const where: Prisma.TicketWhereInput = { deletedAt: null };
+  applyCodemagenTicketVisibility(where, codemagenEnabled);
   if (projectId) where.projectId = projectId;
-  if (priority) where.priority = priority;
+  if (priority) where.priority = priority as any;
 
   const tickets = await prisma.ticket.findMany({
     where,
@@ -346,7 +367,8 @@ router.get('/user-activity', requirePermission('analytics', 'read'), async (req,
 
 router.get('/tickets-flow', requirePermission('analytics', 'read'), async (req, res) => {
   const { projectId } = req.query as { projectId?: string };
-  const where: any = { deletedAt: null };
+  const where: Prisma.TicketWhereInput = { deletedAt: null };
+  applyCodemagenTicketVisibility(where, await getCodemagenEnabled());
   if (projectId) where.projectId = projectId;
 
   const tickets = await prisma.ticket.findMany({

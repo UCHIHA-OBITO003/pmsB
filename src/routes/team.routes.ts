@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { prisma } from '../utils/prisma';
 import { authenticate, requireRole } from '../middleware/auth';
 import { AppError } from '../middleware/errorHandler';
+import { filterVisibleUsers, getCodemagenEnabled, isVisibleUserDepartment } from '../utils/system-settings';
 
 const router = Router();
 router.use(authenticate);
@@ -20,7 +21,7 @@ const MemberBodySchema = z.object({
   role: z.enum(['lead', 'member']).optional(),
 });
 
-async function membersWithUsers(teamId: string) {
+async function membersWithUsers(teamId: string, codemagenEnabled: boolean) {
   const members = await prisma.teamMember.findMany({
     where: { teamId },
     orderBy: { joinedAt: 'asc' },
@@ -29,13 +30,13 @@ async function membersWithUsers(teamId: string) {
   if (userIds.length === 0) return [];
   const users = await prisma.user.findMany({
     where: { id: { in: userIds }, deletedAt: null },
-    select: { id: true, email: true, firstName: true, lastName: true, avatar: true, status: true },
+    select: { id: true, email: true, firstName: true, lastName: true, avatar: true, status: true, department: true },
   });
-  const byId = new Map(users.map((u) => [u.id, u]));
-  return members.map((m) => ({ ...m, user: byId.get(m.userId) ?? null }));
+  const byId = new Map(filterVisibleUsers(users, codemagenEnabled).map((u) => [u.id, u]));
+  return members.map((m) => ({ ...m, user: byId.get(m.userId) ?? null })).filter((m) => m.user != null);
 }
 
-async function listTeamsWithLead() {
+async function listTeamsWithLead(codemagenEnabled: boolean) {
   const teams = await prisma.team.findMany({
     where: { deletedAt: null },
     orderBy: { name: 'asc' },
@@ -46,10 +47,10 @@ async function listTeamsWithLead() {
     leadIds.length > 0 ?
       await prisma.user.findMany({
         where: { id: { in: leadIds }, deletedAt: null },
-        select: { id: true, email: true, firstName: true, lastName: true, avatar: true },
+        select: { id: true, email: true, firstName: true, lastName: true, avatar: true, department: true },
       })
     : [];
-  const leadMap = new Map(leads.map((u) => [u.id, u]));
+  const leadMap = new Map(filterVisibleUsers(leads, codemagenEnabled).map((u) => [u.id, u]));
   return teams.map((t) => ({
     ...t,
     lead: t.leadId ? (leadMap.get(t.leadId) ?? null) : null,
@@ -58,12 +59,13 @@ async function listTeamsWithLead() {
 
 // GET /api/teams
 router.get('/', requireRole('admin', 'project_manager'), async (_req, res) => {
-  const data = await listTeamsWithLead();
+  const data = await listTeamsWithLead(await getCodemagenEnabled());
   res.json({ success: true, data });
 });
 
 // GET /api/teams/:id
 router.get('/:id', requireRole('admin', 'project_manager'), async (req, res) => {
+  const codemagenEnabled = await getCodemagenEnabled();
   const team = await prisma.team.findFirst({
     where: { id: req.params.id, deletedAt: null },
     include: { _count: { select: { members: true, projects: true } } },
@@ -71,16 +73,23 @@ router.get('/:id', requireRole('admin', 'project_manager'), async (req, res) => 
   if (!team) throw new AppError(404, 'Team not found', 'NOT_FOUND');
 
   const [members, lead] = await Promise.all([
-    membersWithUsers(team.id),
+    membersWithUsers(team.id, codemagenEnabled),
     team.leadId ?
       prisma.user.findFirst({
         where: { id: team.leadId, deletedAt: null },
-        select: { id: true, email: true, firstName: true, lastName: true, avatar: true },
+        select: { id: true, email: true, firstName: true, lastName: true, avatar: true, department: true },
       })
     : Promise.resolve(null),
   ]);
 
-  res.json({ success: true, data: { ...team, members, lead } });
+  res.json({
+    success: true,
+    data: {
+      ...team,
+      members,
+      lead: lead && isVisibleUserDepartment(lead.department, codemagenEnabled) ? lead : null,
+    },
+  });
 });
 
 // POST /api/teams
@@ -107,13 +116,14 @@ router.post('/', requireRole('admin'), async (req, res) => {
     },
   });
 
-  const full = await listTeamsWithLead();
+  const full = await listTeamsWithLead(await getCodemagenEnabled());
   const row = full.find((t) => t.id === team.id);
   res.status(201).json({ success: true, data: row ?? team });
 });
 
 // PATCH /api/teams/:id
 router.patch('/:id', requireRole('admin', 'project_manager'), async (req, res) => {
+  const codemagenEnabled = await getCodemagenEnabled();
   const patch = PatchTeamSchema.parse(req.body);
 
   const team = await prisma.team.findFirst({ where: { id: req.params.id, deletedAt: null } });
@@ -143,16 +153,23 @@ router.patch('/:id', requireRole('admin', 'project_manager'), async (req, res) =
     where: { id: team.id },
     include: { _count: { select: { members: true, projects: true } } },
   });
-  const members = await membersWithUsers(team.id);
+  const members = await membersWithUsers(team.id, codemagenEnabled);
   const lead =
     updated?.leadId ?
       await prisma.user.findFirst({
         where: { id: updated.leadId, deletedAt: null },
-        select: { id: true, email: true, firstName: true, lastName: true, avatar: true },
+        select: { id: true, email: true, firstName: true, lastName: true, avatar: true, department: true },
       })
     : null;
 
-  res.json({ success: true, data: { ...updated!, members, lead } });
+  res.json({
+    success: true,
+    data: {
+      ...updated!,
+      members,
+      lead: lead && isVisibleUserDepartment(lead.department, codemagenEnabled) ? lead : null,
+    },
+  });
 });
 
 // DELETE /api/teams/:id (soft delete; unlink projects)
@@ -189,7 +206,7 @@ router.post('/:id/members', requireRole('admin', 'project_manager'), async (req,
     await prisma.team.update({ where: { id: team.id }, data: { leadId: body.userId } });
   }
 
-  const members = await membersWithUsers(team.id);
+  const members = await membersWithUsers(team.id, await getCodemagenEnabled());
   res.json({ success: true, data: members });
 });
 
@@ -206,7 +223,7 @@ router.delete('/:id/members/:userId', requireRole('admin', 'project_manager'), a
     await prisma.team.update({ where: { id: teamId }, data: { leadId: null } });
   }
 
-  const members = await membersWithUsers(teamId);
+  const members = await membersWithUsers(teamId, await getCodemagenEnabled());
   res.json({ success: true, data: members });
 });
 

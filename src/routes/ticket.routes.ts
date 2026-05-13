@@ -26,6 +26,7 @@ import {
   applyCodemagenTicketVisibility,
   applyCodemagenUserVisibility,
   assertCodemagenEnabled,
+  filterVisibleUsers,
   getCodemagenEnabled,
 } from '../utils/system-settings';
 
@@ -304,7 +305,7 @@ router.get('/', requirePermission('tickets', 'read'), async (req: AuthRequest, r
     prisma.ticket.findMany({
       where,
       include: {
-        assignees: { select: { id: true, firstName: true, lastName: true, avatar: true } },
+        assignees: { select: { id: true, firstName: true, lastName: true, avatar: true, department: true } },
         reporter: { select: { id: true, firstName: true, lastName: true } },
         workflowState: true,
         project: { select: { id: true, name: true, key: true } },
@@ -318,7 +319,18 @@ router.get('/', requirePermission('tickets', 'read'), async (req: AuthRequest, r
     prisma.ticket.count({ where }),
   ]);
 
-  res.json({ success: true, data: { tickets, total, page: pageNum, limit: take } });
+  res.json({
+    success: true,
+    data: {
+      tickets: tickets.map((ticket) => ({
+        ...ticket,
+        assignees: filterVisibleUsers(ticket.assignees, codemagenEnabled),
+      })),
+      total,
+      page: pageNum,
+      limit: take,
+    },
+  });
 });
 
 /** Who can be assigned — all active users + projectMemberIds highlights project roster. */
@@ -675,14 +687,17 @@ router.post('/:id/sync-legacy', requirePermission('tickets', 'update'), async (r
 
 // GET /api/tickets/:id
 router.get('/:id', requirePermission('tickets', 'read'), async (req: AuthRequest, res) => {
+  const codemagenEnabled = await getCodemagenEnabled();
   const whereTicket: Prisma.TicketWhereInput = { id: req.params.id, deletedAt: null };
-  applyCodemagenTicketVisibility(whereTicket, await getCodemagenEnabled());
+  applyCodemagenTicketVisibility(whereTicket, codemagenEnabled);
   applyTicketParticipantScope(whereTicket, req.user!.id, req.user!.roles);
 
   const ticket = await prisma.ticket.findFirst({
     where: whereTicket,
     include: {
-      assignees: { select: { id: true, firstName: true, lastName: true, avatar: true, email: true } },
+      assignees: {
+        select: { id: true, firstName: true, lastName: true, avatar: true, email: true, department: true },
+      },
       reporter: { select: { id: true, firstName: true, lastName: true } },
       workflowState: true,
       project: { select: { id: true, name: true, key: true } },
@@ -697,7 +712,10 @@ router.get('/:id', requirePermission('tickets', 'read'), async (req: AuthRequest
       history: { orderBy: { createdAt: 'desc' }, take: 50 },
       statusDurations: true,
       children: {
-        include: { workflowState: true, assignees: { select: { id: true, firstName: true, lastName: true } } },
+        include: {
+          workflowState: true,
+          assignees: { select: { id: true, firstName: true, lastName: true, department: true } },
+        },
       },
       checklistItems: { orderBy: { sortOrder: 'asc' } },
       linksFrom: {
@@ -705,7 +723,7 @@ router.get('/:id', requirePermission('tickets', 'read'), async (req: AuthRequest
       },
       watchers: {
         include: {
-          user: { select: { id: true, firstName: true, lastName: true, email: true, avatar: true } },
+          user: { select: { id: true, firstName: true, lastName: true, email: true, avatar: true, department: true } },
         },
       },
       _count: { select: { votes: true } },
@@ -718,7 +736,19 @@ router.get('/:id', requirePermission('tickets', 'read'), async (req: AuthRequest
     dueDate: ticket.dueDate,
     createdAt: ticket.createdAt,
   });
-  res.json({ success: true, data: { ...ticket, sla } });
+  res.json({
+    success: true,
+    data: {
+      ...ticket,
+      assignees: filterVisibleUsers(ticket.assignees, codemagenEnabled),
+      children: ticket.children.map((child) => ({
+        ...child,
+        assignees: filterVisibleUsers(child.assignees, codemagenEnabled),
+      })),
+      watchers: ticket.watchers.filter((watcher) => !watcher.user || filterVisibleUsers([watcher.user], codemagenEnabled).length > 0),
+      sla,
+    },
+  });
 });
 
 // POST /api/tickets

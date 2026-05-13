@@ -152,7 +152,7 @@ export async function buildSystemOverview() {
     featureFlags: {
       codemagenEnabled,
       codemagenNote:
-        'Redis-backed global toggle. Off = Codemagen tickets/users stay hidden and new Codemagen ingestion/sync endpoints reject requests.',
+        'Redis-backed global toggle. Off = legacy migrated Codemagen tickets and Codemagen users stay hidden, and new Codemagen ingestion/sync endpoints reject requests.',
     },
     infrastructureNote:
       'VRAM-style limits and egress charts remain in Render / host dashboards — here you see process-visible memory plus DB/Redis pings.',

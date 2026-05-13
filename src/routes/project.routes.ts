@@ -1,8 +1,15 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '../utils/prisma';
 import { authenticate, requirePermission, requireRole, AuthRequest } from '../middleware/auth';
 import { AppError } from '../middleware/errorHandler';
+import {
+  applyCodemagenTicketVisibility,
+  filterVisibleMembershipUsers,
+  filterVisibleUsers,
+  getCodemagenEnabled,
+} from '../utils/system-settings';
 
 const router = Router();
 router.use(authenticate);
@@ -56,11 +63,27 @@ router.get('/', requirePermission('projects', 'read'), async (req: AuthRequest, 
 
 // GET /api/projects/:id
 router.get('/:id', requirePermission('projects', 'read'), async (req, res) => {
+  const codemagenEnabled = await getCodemagenEnabled();
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, deletedAt: null },
     include: {
       company: { select: { id: true, name: true, organisationId: true } },
-      members: { include: { user: { select: { id: true, email: true, firstName: true, lastName: true, avatar: true, status: true, skills: true } } } },
+      members: {
+        include: {
+          user: {
+            select: {
+              id: true,
+              email: true,
+              firstName: true,
+              lastName: true,
+              avatar: true,
+              status: true,
+              skills: true,
+              department: true,
+            },
+          },
+        },
+      },
       sprints: { where: { status: 'ACTIVE' }, take: 1 },
       _count: { select: { tickets: true, sprints: true, members: true } },
       workflowStates: { orderBy: { order: 'asc' } },
@@ -68,11 +91,18 @@ router.get('/:id', requirePermission('projects', 'read'), async (req, res) => {
   });
 
   if (!project) throw new AppError(404, 'Project not found', 'NOT_FOUND');
-  res.json({ success: true, data: project });
+  res.json({
+    success: true,
+    data: {
+      ...project,
+      members: filterVisibleMembershipUsers(project.members, codemagenEnabled),
+    },
+  });
 });
 
 // GET /api/projects/:id/roster-summary — company, org, team, members, ticket counts by source
 router.get('/:id/roster-summary', requirePermission('projects', 'read'), async (req, res) => {
+  const codemagenEnabled = await getCodemagenEnabled();
   const project = await prisma.project.findFirst({
     where: { id: req.params.id, deletedAt: null },
     include: {
@@ -86,7 +116,7 @@ router.get('/:id/roster-summary', requirePermission('projects', 'read'), async (
       },
       members: {
         include: {
-          user: { select: { id: true, firstName: true, lastName: true, email: true, status: true } },
+          user: { select: { id: true, firstName: true, lastName: true, email: true, status: true, department: true } },
         },
       },
     },
@@ -98,18 +128,30 @@ router.get('/:id/roster-summary', requirePermission('projects', 'read'), async (
     teamMemberIds.length > 0 ?
       await prisma.user.findMany({
         where: { id: { in: teamMemberIds }, deletedAt: null },
-        select: { id: true, firstName: true, lastName: true, email: true, status: true },
+        select: { id: true, firstName: true, lastName: true, email: true, status: true, department: true },
       })
     : [];
 
+  const ticketCountWhere: Prisma.TicketWhereInput = { projectId: req.params.id, deletedAt: null };
+  applyCodemagenTicketVisibility(ticketCountWhere, codemagenEnabled);
   const bySource = await prisma.ticket.groupBy({
     by: ['source'],
-    where: { projectId: req.params.id, deletedAt: null },
+    where: ticketCountWhere,
     _count: true,
   });
   const ticketCountBySource = Object.fromEntries(bySource.map((r) => [r.source, r._count]));
 
-  res.json({ success: true, data: { project, teamUsers, ticketCountBySource } });
+  res.json({
+    success: true,
+    data: {
+      project: {
+        ...project,
+        members: filterVisibleMembershipUsers(project.members, codemagenEnabled),
+      },
+      teamUsers: filterVisibleUsers(teamUsers, codemagenEnabled),
+      ticketCountBySource,
+    },
+  });
 });
 
 // POST /api/projects
