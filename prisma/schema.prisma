@@ -369,6 +369,7 @@ model WorkflowState {
   slug      String // "todo" | "in_progress" | "in_review" | "blocked" | "done"
   color     String   @default("#6366f1")
   order     Int      @default(0)
+  wipLimit  Int?
   isDefault Boolean  @default(false)
   isFinal   Boolean  @default(false)
   createdAt DateTime @default(now())
@@ -420,6 +421,7 @@ model Ticket {
   companyId       String?
   sprintId        String?
   workflowStateId String?
+  boardOrder      Float          @default(0)
   parentId        String?
   title           String
   description     String?
@@ -472,6 +474,7 @@ model Ticket {
 
   @@index([projectId])
   @@index([sprintId])
+  @@index([projectId, workflowStateId, boardOrder])
   @@index([sourceUrl])
   @@index([legacyIssueNumber])
   @@map("tickets")

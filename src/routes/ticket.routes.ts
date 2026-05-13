@@ -30,6 +30,8 @@ import {
   getTicketCompanyLabel,
   getCodemagenEnabled,
 } from '../utils/system-settings';
+import { emitBoardEvent } from '../services/board-events.service';
+import { getInitialBoardOrder, transitionTicketWorkflow } from '../services/ticket-transition.service';
 
 const router = Router();
 router.use(authenticate);
@@ -796,6 +798,7 @@ router.post('/', requirePermission('tickets', 'create'), async (req: AuthRequest
       ...data,
       reporterId: req.user!.id,
       workflowStateId: defaultState?.id,
+      boardOrder: defaultState ? await getInitialBoardOrder(data.projectId, defaultState.id) : 0,
       companyId: data.companyId === undefined ? projectCompanyId ?? undefined : data.companyId,
       assignees: assigneeIds ? { connect: assigneeIds.map(id => ({ id })) } : undefined,
     },
@@ -804,6 +807,19 @@ router.post('/', requirePermission('tickets', 'create'), async (req: AuthRequest
   // Log history
   await prisma.ticketHistory.create({
     data: { ticketId: ticket.id, actorId: req.user!.id, field: 'created', newValue: 'ticket created' },
+  });
+  if (ticket.workflowStateId) {
+    await prisma.ticketStatusDuration.create({
+      data: { ticketId: ticket.id, status: ticket.workflowStateId, startedAt: new Date() },
+    });
+  }
+
+  emitBoardEvent({
+    type: 'ticket.created',
+    projectId: ticket.projectId,
+    ticketId: ticket.id,
+    workflowStateId: ticket.workflowStateId,
+    at: new Date().toISOString(),
   });
 
   void notifyTicketCreated(ticket.id, req.user!.id);
@@ -820,6 +836,8 @@ router.patch('/:id', requirePermission('tickets', 'update'), async (req: AuthReq
   const cleanUpdates = Object.fromEntries(
     Object.entries(updates).filter(([, v]) => v !== undefined),
   ) as Record<string, unknown>;
+  const requestedWorkflowStateId = typeof cleanUpdates.workflowStateId === 'string' ? cleanUpdates.workflowStateId : undefined;
+  if (requestedWorkflowStateId) delete cleanUpdates.workflowStateId;
 
   const patchWhere: Prisma.TicketWhereInput = { id: req.params.id, deletedAt: null };
   applyTicketParticipantScope(patchWhere, req.user!.id, req.user!.roles);
@@ -832,8 +850,6 @@ router.patch('/:id', requirePermission('tickets', 'update'), async (req: AuthReq
     },
   });
   if (!existing) throw new AppError(404, 'Ticket not found', 'NOT_FOUND');
-
-  const previousWorkflowStateName = existing.workflowState?.name ?? null;
 
   const ticket = await prisma.ticket.update({
     where: { id: req.params.id },
@@ -881,26 +897,31 @@ router.patch('/:id', requirePermission('tickets', 'update'), async (req: AuthReq
     });
   }
 
-  // Track status duration
-  const newWorkflowId = cleanUpdates.workflowStateId as string | undefined;
-  if (newWorkflowId && existing.workflowStateId !== newWorkflowId) {
-    await prisma.ticketStatusDuration.updateMany({
-      where: { ticketId: ticket.id, endedAt: null },
-      data: { endedAt: new Date() },
+  if (requestedWorkflowStateId && existing.workflowStateId !== requestedWorkflowStateId) {
+    await transitionTicketWorkflow({
+      ticketId: ticket.id,
+      projectId: existing.projectId,
+      actor: { id: req.user!.id, roles: req.user!.roles },
+      workflowStateId: requestedWorkflowStateId,
     });
-    await prisma.ticketStatusDuration.create({
-      data: { ticketId: ticket.id, status: newWorkflowId, startedAt: new Date() },
+  } else {
+    emitBoardEvent({
+      type: 'ticket.updated',
+      projectId: existing.projectId,
+      ticketId: ticket.id,
+      workflowStateId: existing.workflowStateId,
+      at: new Date().toISOString(),
     });
   }
 
   void notifyTicketUpdated(
     { assignees: existing.assignees },
     ticket.id,
-    cleanUpdates,
+    { ...cleanUpdates, ...(requestedWorkflowStateId ? { workflowStateId: requestedWorkflowStateId } : {}) },
     req.user!.id,
     {
       assigneeIdsApplied: assigneeIds,
-      previousWorkflowStateName,
+      previousWorkflowStateName: existing.workflowState?.name ?? null,
     },
   );
 

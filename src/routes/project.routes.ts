@@ -10,6 +10,7 @@ import {
   filterVisibleUsers,
   getCodemagenEnabled,
 } from '../utils/system-settings';
+import { emitBoardEvent } from '../services/board-events.service';
 
 const router = Router();
 router.use(authenticate);
@@ -229,7 +230,9 @@ router.delete('/:id', requirePermission('projects', 'delete'), async (req, res) 
 router.post('/:id/members', requirePermission('projects', 'update'), async (req, res) => {
   const { userId, role } = z.object({
     userId: z.string().uuid(),
-    role: z.enum(['pm', 'lead', 'developer', 'qa', 'stakeholder']),
+    role: z.enum(['pm', 'lead', 'developer', 'qa', 'tester', 'stakeholder']).transform((value) =>
+      value === 'tester' ? 'qa' : value,
+    ),
   }).parse(req.body);
 
   await prisma.projectMember.upsert({
@@ -468,31 +471,246 @@ router.get('/:id/risks', requirePermission('projects', 'read'), async (req, res)
   res.json({ success: true, data: risks });
 });
 
+const WorkflowStateSchema = z.object({
+  name: z.string().min(1).max(80),
+  slug: z.string().min(1).max(80).regex(/^[a-z0-9_-]+$/i, 'Slug can only use letters, numbers, underscores, and hyphens'),
+  color: z.string().min(1).max(32).default('#6366f1'),
+  order: z.number().int().optional(),
+  isDefault: z.boolean().optional(),
+  isFinal: z.boolean().optional(),
+  wipLimit: z.number().int().positive().nullable().optional(),
+});
+
 const WorkflowReorderSchema = z.object({
   states: z.array(z.object({
     id: z.string(),
     order: z.number().int(),
     name: z.string().min(1).optional(),
+    slug: z.string().min(1).max(80).regex(/^[a-z0-9_-]+$/i).optional(),
+    color: z.string().min(1).max(32).optional(),
+    isDefault: z.boolean().optional(),
+    isFinal: z.boolean().optional(),
+    wipLimit: z.number().int().positive().nullable().optional(),
   })).min(1),
+});
+
+const WorkflowTransitionConfigSchema = z.object({
+  transitions: z.array(z.object({
+    fromStateId: z.string().uuid(),
+    toStateId: z.string().uuid(),
+    requiresRole: z.string().trim().min(1).nullable().optional(),
+    requiresNote: z.boolean().optional(),
+  })),
+});
+
+const WorkflowDeleteSchema = z.object({
+  replacementStateId: z.string().uuid().optional(),
+});
+
+router.get('/:id/workflow/config', requirePermission('projects', 'read'), async (req, res) => {
+  const [states, transitions] = await Promise.all([
+    prisma.workflowState.findMany({
+      where: { projectId: req.params.id },
+      orderBy: { order: 'asc' },
+    }),
+    prisma.workflowTransition.findMany({
+      where: { fromState: { projectId: req.params.id } },
+      orderBy: [{ fromStateId: 'asc' }, { toStateId: 'asc' }],
+    }),
+  ]);
+
+  res.json({ success: true, data: { states, transitions } });
 });
 
 router.patch('/:id/workflow', requirePermission('projects', 'update'), async (req: AuthRequest, res) => {
   const parsed = WorkflowReorderSchema.parse(req.body);
 
-  await prisma.$transaction(
-    parsed.states.map((s) =>
-      prisma.workflowState.updateMany({
-        where: { id: s.id, projectId: req.params.id },
-        data: { order: s.order, ...(s.name !== undefined ? { name: s.name } : {}) },
-      }),
-    ),
-  );
+  await prisma.$transaction(async (tx) => {
+    if (parsed.states.some((state) => state.isDefault)) {
+      await tx.workflowState.updateMany({
+        where: { projectId: req.params.id },
+        data: { isDefault: false },
+      });
+    }
+
+    await Promise.all(
+      parsed.states.map((s) =>
+        tx.workflowState.updateMany({
+          where: { id: s.id, projectId: req.params.id },
+          data: {
+            order: s.order,
+            ...(s.name !== undefined ? { name: s.name } : {}),
+            ...(s.slug !== undefined ? { slug: s.slug } : {}),
+            ...(s.color !== undefined ? { color: s.color } : {}),
+            ...(s.isDefault !== undefined ? { isDefault: s.isDefault } : {}),
+            ...(s.isFinal !== undefined ? { isFinal: s.isFinal } : {}),
+            ...(s.wipLimit !== undefined ? { wipLimit: s.wipLimit } : {}),
+          },
+        }),
+      ),
+    );
+  });
 
   const workflowStates = await prisma.workflowState.findMany({
     where: { projectId: req.params.id },
     orderBy: { order: 'asc' },
   });
+  emitBoardEvent({ type: 'workflow.updated', projectId: req.params.id, at: new Date().toISOString() });
   res.json({ success: true, data: workflowStates });
+});
+
+router.post('/:id/workflow/states', requirePermission('projects', 'update'), async (req: AuthRequest, res) => {
+  const parsed = WorkflowStateSchema.parse(req.body);
+  const currentMax = await prisma.workflowState.aggregate({
+    where: { projectId: req.params.id },
+    _max: { order: true },
+  });
+
+  const state = await prisma.$transaction(async (tx) => {
+    if (parsed.isDefault) {
+      await tx.workflowState.updateMany({
+        where: { projectId: req.params.id },
+        data: { isDefault: false },
+      });
+    }
+
+    return tx.workflowState.create({
+      data: {
+        projectId: req.params.id,
+        name: parsed.name,
+        slug: parsed.slug,
+        color: parsed.color,
+        order: parsed.order ?? (currentMax._max.order ?? -1) + 1,
+        isDefault: parsed.isDefault ?? false,
+        isFinal: parsed.isFinal ?? false,
+        wipLimit: parsed.wipLimit ?? null,
+      },
+    });
+  });
+
+  emitBoardEvent({ type: 'workflow.updated', projectId: req.params.id, at: new Date().toISOString() });
+  res.status(201).json({ success: true, data: state });
+});
+
+router.patch('/:id/workflow/states/:stateId', requirePermission('projects', 'update'), async (req: AuthRequest, res) => {
+  const parsed = WorkflowStateSchema.partial().parse(req.body);
+  const existing = await prisma.workflowState.findFirst({
+    where: { id: req.params.stateId, projectId: req.params.id },
+    select: { id: true },
+  });
+  if (!existing) throw new AppError(404, 'Workflow state not found', 'NOT_FOUND');
+
+  const state = await prisma.$transaction(async (tx) => {
+    if (parsed.isDefault) {
+      await tx.workflowState.updateMany({
+        where: { projectId: req.params.id },
+        data: { isDefault: false },
+      });
+    }
+
+    return tx.workflowState.update({
+      where: { id: req.params.stateId },
+      data: parsed,
+    });
+  });
+
+  emitBoardEvent({ type: 'workflow.updated', projectId: req.params.id, at: new Date().toISOString() });
+  res.json({ success: true, data: state });
+});
+
+router.delete('/:id/workflow/states/:stateId', requirePermission('projects', 'update'), async (req: AuthRequest, res) => {
+  const parsed = WorkflowDeleteSchema.parse(req.body ?? {});
+  const state = await prisma.workflowState.findFirst({
+    where: { id: req.params.stateId, projectId: req.params.id },
+  });
+  if (!state) throw new AppError(404, 'Workflow state not found', 'NOT_FOUND');
+
+  const remainingCount = await prisma.workflowState.count({ where: { projectId: req.params.id } });
+  if (remainingCount <= 1) throw new AppError(400, 'Project must keep at least one workflow state', 'BAD_REQUEST');
+
+  const affectedTickets = await prisma.ticket.count({
+    where: { projectId: req.params.id, workflowStateId: req.params.stateId, deletedAt: null },
+  });
+
+  if (affectedTickets > 0 && !parsed.replacementStateId) {
+    throw new AppError(400, 'Choose a replacement state before deleting a state with tickets', 'REPLACEMENT_REQUIRED');
+  }
+
+  if (parsed.replacementStateId) {
+    const replacement = await prisma.workflowState.findFirst({
+      where: { id: parsed.replacementStateId, projectId: req.params.id },
+      select: { id: true },
+    });
+    if (!replacement) throw new AppError(400, 'Replacement state must belong to the same project', 'BAD_STATE');
+  }
+
+  await prisma.$transaction(async (tx) => {
+    if (parsed.replacementStateId) {
+      await tx.ticket.updateMany({
+        where: { projectId: req.params.id, workflowStateId: req.params.stateId, deletedAt: null },
+        data: { workflowStateId: parsed.replacementStateId },
+      });
+    }
+
+    await tx.workflowTransition.deleteMany({
+      where: {
+        OR: [{ fromStateId: req.params.stateId }, { toStateId: req.params.stateId }],
+      },
+    });
+
+    await tx.workflowState.delete({
+      where: { id: req.params.stateId },
+    });
+
+    if (state.isDefault && parsed.replacementStateId) {
+      await tx.workflowState.update({
+        where: { id: parsed.replacementStateId },
+        data: { isDefault: true },
+      });
+    }
+  });
+
+  emitBoardEvent({ type: 'workflow.updated', projectId: req.params.id, at: new Date().toISOString() });
+  res.json({ success: true, message: 'Workflow state deleted' });
+});
+
+router.put('/:id/workflow/transitions', requirePermission('projects', 'update'), async (req: AuthRequest, res) => {
+  const parsed = WorkflowTransitionConfigSchema.parse(req.body);
+  const stateIds = await prisma.workflowState.findMany({
+    where: { projectId: req.params.id },
+    select: { id: true },
+  });
+  const validIds = new Set(stateIds.map((state) => state.id));
+
+  for (const transition of parsed.transitions) {
+    if (!validIds.has(transition.fromStateId) || !validIds.has(transition.toStateId)) {
+      throw new AppError(400, 'Transitions must reference workflow states in the same project', 'BAD_TRANSITION');
+    }
+  }
+
+  await prisma.$transaction(async (tx) => {
+    await tx.workflowTransition.deleteMany({
+      where: { fromStateId: { in: [...validIds] } },
+    });
+
+    if (parsed.transitions.length > 0) {
+      await tx.workflowTransition.createMany({
+        data: parsed.transitions.map((transition) => ({
+          fromStateId: transition.fromStateId,
+          toStateId: transition.toStateId,
+          requiresRole: transition.requiresRole ?? null,
+          requiresNote: transition.requiresNote ?? false,
+        })),
+      });
+    }
+  });
+
+  const transitions = await prisma.workflowTransition.findMany({
+    where: { fromStateId: { in: [...validIds] } },
+    orderBy: [{ fromStateId: 'asc' }, { toStateId: 'asc' }],
+  });
+  emitBoardEvent({ type: 'workflow.updated', projectId: req.params.id, at: new Date().toISOString() });
+  res.json({ success: true, data: transitions });
 });
 
 export default router;
