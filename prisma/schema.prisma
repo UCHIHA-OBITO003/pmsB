@@ -58,6 +58,11 @@ model User {
   ticketVotes           TicketVote[]
   sprintRetrospectives  SprintRetrospective[] @relation("SprintRetroAuthor")
   projectDocs           ProjectDoc[]
+  emailPreferences      UserEmailPreference?
+  emailDeliveries       EmailDelivery[]
+  githubIdentity        UserGitHubIdentity?
+  githubDailySummaries  GitHubDailySummary[]
+  githubMappedEvents    GitHubActivityEvent[] @relation("GitHubMappedUser")
 
   @@index([email])
   @@index([department])
@@ -76,6 +81,26 @@ model EmailOtp {
 
   @@index([email, purpose])
   @@map("email_otps")
+}
+
+model UserEmailPreference {
+  userId                String   @id
+  transactionalEnabled  Boolean  @default(true)
+  securityEnabled       Boolean  @default(true)
+  ticketInstantEnabled  Boolean  @default(true)
+  commentInstantEnabled Boolean  @default(true)
+  digestEnabled         Boolean  @default(true)
+  ownerAnalyticsEnabled Boolean  @default(false)
+  ownerAnalyticsCadence OwnerAnalyticsCadence @default(DAILY)
+  ownerAnalyticsLookbackDays Int?
+  lastDigestAt          DateTime?
+  lastOwnerAnalyticsSentAt DateTime?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_email_preferences")
 }
 
 model Role {
@@ -306,6 +331,51 @@ enum ProjectStatus {
   PLANNING
 }
 
+enum GitHubAccountType {
+  USER
+  ORGANIZATION
+}
+
+enum GitHubLinkStatus {
+  PENDING
+  ACTIVE
+  DISCONNECTED
+  ERROR
+}
+
+enum GitHubSyncStatus {
+  IDLE
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+enum GitHubIdentitySource {
+  MANUAL
+  AUTO
+  EMAIL
+  WEBHOOK
+}
+
+enum OwnerAnalyticsCadence {
+  DAILY
+  WEEKLY
+  MONTHLY
+  CUSTOM
+}
+
+enum GitHubEventType {
+  COMMIT
+  PULL_REQUEST
+  ISSUE
+  ISSUE_COMMENT
+  REVIEW
+  CHECK_RUN
+  PROJECT_ITEM
+  RELEASE
+  UNKNOWN
+}
+
 model Project {
   id          String        @id @default(uuid())
   name        String
@@ -320,28 +390,39 @@ model Project {
   budget      Float?
   healthScore Float?
   metadata    Json?
+  githubBoardInstallationId String?
+  githubBoardOwnerLogin     String?
+  githubBoardOwnerType      GitHubAccountType?
+  githubProjectId           String?
+  githubProjectNumber       Int?
+  githubProjectTitle        String?
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
   deletedAt   DateTime?
 
-  company          Company?          @relation(fields: [companyId], references: [id], onDelete: SetNull)
-  team             Team?             @relation(fields: [teamId], references: [id])
-  members          ProjectMember[]
-  tickets          Ticket[]
-  sprints          Sprint[]
-  imports          ExcelImport[]
-  analytics        ProjectAnalytic[]
-  workflowStates   WorkflowState[]
-  sheetSyncConfigs SheetSyncConfig[]
+  company                Company?            @relation(fields: [companyId], references: [id], onDelete: SetNull)
+  team                   Team?               @relation(fields: [teamId], references: [id])
+  members                ProjectMember[]
+  tickets                Ticket[]
+  sprints                Sprint[]
+  imports                ExcelImport[]
+  analytics              ProjectAnalytic[]
+  workflowStates         WorkflowState[]
+  sheetSyncConfigs       SheetSyncConfig[]
   legacySheetTargets SheetSyncConfig[] @relation("LegacySheetTarget")
-  externalSyncJobs ExternalSyncJob[]
-  milestones       ProjectMilestone[]
-  docs             ProjectDoc[]
-  releases         ProjectRelease[]
-  ticketTemplates  TicketTemplate[]
+  externalSyncJobs       ExternalSyncJob[]
+  milestones             ProjectMilestone[]
+  docs                   ProjectDoc[]
+  releases               ProjectRelease[]
+  ticketTemplates        TicketTemplate[]
+  githubLinks            ProjectGitHubLink[]
+  githubBoardInstallation GitHubInstallation? @relation("ProjectGitHubBoardInstallation", fields: [githubBoardInstallationId], references: [id], onDelete: SetNull)
+  githubDailySummaries   GitHubDailySummary[]
 
   @@index([status])
   @@index([companyId])
+  @@index([githubBoardInstallationId])
+  @@index([githubProjectId])
   @@map("projects")
 }
 
@@ -356,6 +437,141 @@ model ProjectMember {
 
   @@id([projectId, userId])
   @@map("project_members")
+}
+
+model GitHubInstallation {
+  id                   String            @id @default(uuid())
+  githubInstallationId String            @unique
+  accountId            String?
+  accountLogin         String
+  accountType          GitHubAccountType @default(ORGANIZATION)
+  appSlug              String?
+  targetType           String?
+  repositorySelection  String?
+  permissions          Json?
+  lastWebhookAt        DateTime?
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+
+  projectLinks  ProjectGitHubLink[] @relation("ProjectGitHubRepoInstallation")
+  projectBoards Project[]           @relation("ProjectGitHubBoardInstallation")
+
+  @@index([accountLogin])
+  @@map("github_installations")
+}
+
+model ProjectGitHubLink {
+  id                    String            @id @default(uuid())
+  projectId             String
+  installationId        String
+  ownerLogin            String
+  ownerType             GitHubAccountType @default(ORGANIZATION)
+  repositoryId          String
+  repositoryNodeId      String?
+  repositoryName        String
+  repositoryFullName    String
+  defaultBranch         String?
+  status                GitHubLinkStatus  @default(PENDING)
+  syncEnabled           Boolean           @default(true)
+  lastSyncCursor        DateTime?
+  lastSyncedAt          DateTime?
+  lastSyncStatus        GitHubSyncStatus  @default(IDLE)
+  lastSyncError         String?
+  lastWebhookDeliveredAt DateTime?
+  createdBy             String?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+
+  project      Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  installation GitHubInstallation   @relation("ProjectGitHubRepoInstallation", fields: [installationId], references: [id], onDelete: Cascade)
+  events       GitHubActivityEvent[]
+
+  @@unique([projectId, repositoryId])
+  @@index([projectId])
+  @@index([installationId])
+  @@index([repositoryFullName])
+  @@index([status, syncEnabled])
+  @@map("project_github_links")
+}
+
+model UserGitHubIdentity {
+  id           String               @id @default(uuid())
+  userId       String               @unique
+  githubUserId String               @unique
+  login        String
+  displayName  String?
+  primaryEmail String?
+  avatarUrl    String?
+  profileUrl   String?
+  source       GitHubIdentitySource @default(MANUAL)
+  confidence   Float?
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([login])
+  @@index([primaryEmail])
+  @@map("user_github_identities")
+}
+
+model GitHubActivityEvent {
+  id                 String          @id @default(uuid())
+  projectGitHubLinkId String
+  githubDeliveryId   String?
+  eventType          GitHubEventType
+  action             String          @default("")
+  externalId         String
+  actorGithubUserId  String?
+  actorLogin         String?
+  actorDisplayName   String?
+  actorEmail         String?
+  branch             String?
+  title              String?
+  body               String?
+  url                String?
+  commitSha          String?
+  occurredAt         DateTime
+  mappedUserId       String?
+  payload            Json?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  projectLink ProjectGitHubLink @relation(fields: [projectGitHubLinkId], references: [id], onDelete: Cascade)
+  mappedUser  User?             @relation("GitHubMappedUser", fields: [mappedUserId], references: [id], onDelete: SetNull)
+
+  @@unique([projectGitHubLinkId, eventType, externalId, action])
+  @@index([projectGitHubLinkId, occurredAt])
+  @@index([mappedUserId, occurredAt])
+  @@index([actorLogin])
+  @@map("github_activity_events")
+}
+
+model GitHubDailySummary {
+  id                String   @id @default(uuid())
+  projectId         String
+  userId            String
+  date              DateTime @db.Date
+  commits           Int      @default(0)
+  pullRequestsOpened Int     @default(0)
+  pullRequestsMerged Int     @default(0)
+  reviewsSubmitted  Int      @default(0)
+  issuesUpdated     Int      @default(0)
+  checksPassed      Int      @default(0)
+  checksFailed      Int      @default(0)
+  projectItemsMoved Int      @default(0)
+  summary           String
+  plannedNext       String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId, date])
+  @@index([projectId, date])
+  @@index([userId, date])
+  @@map("github_daily_summaries")
 }
 
 // ============================================================
@@ -809,6 +1025,28 @@ enum NotificationType {
   REMINDER
 }
 
+enum EmailDeliveryStatus {
+  QUEUED
+  SENT
+  FAILED
+  SKIPPED
+}
+
+enum EmailEventType {
+  PASSWORD_RESET_OTP
+  USER_WELCOME
+  USER_PROFILE_UPDATED
+  TICKET_CREATED
+  TICKET_ASSIGNED
+  TICKET_UNASSIGNED
+  TICKET_UPDATED
+  TICKET_COMMENTED
+  TICKET_COMPLETED
+  TICKET_REOPENED
+  TICKET_DIGEST_DAILY
+  OWNER_ANALYTICS_REPORT
+}
+
 model NotificationTemplate {
   id        String   @id @default(uuid())
   name      String   @unique
@@ -844,6 +1082,36 @@ model Notification {
 
   @@index([userId, isRead])
   @@map("notifications")
+}
+
+model EmailDelivery {
+  id           String              @id @default(uuid())
+  userId       String?
+  to           String
+  subject      String
+  templateKey  String
+  eventType    EmailEventType
+  status       EmailDeliveryStatus @default(QUEUED)
+  channel      String              @default("smtp")
+  messageId    String?
+  errorDetail  String?
+  fingerprint  String?
+  resourceType String?
+  resourceId   String?
+  metadata     Json?
+  queuedAt     DateTime            @default(now())
+  sentAt       DateTime?
+  failedAt     DateTime?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, eventType, queuedAt])
+  @@index([status, queuedAt])
+  @@index([resourceType, resourceId])
+  @@index([fingerprint])
+  @@map("email_deliveries")
 }
 
 // ============================================================

@@ -8,6 +8,7 @@ import {
   filterVisibleUsers,
   getCodemagenEnabled,
 } from '../utils/system-settings';
+import { getGitHubAnalyticsOverview } from '../services/github.service';
 
 const router = Router();
 router.use(authenticate);
@@ -25,6 +26,12 @@ router.get('/users', requirePermission('analytics', 'read'), async (req, res) =>
     orderBy: { firstName: 'asc' },
   });
   res.json({ success: true, data: users });
+});
+
+router.get('/github', requirePermission('analytics', 'read'), async (req, res) => {
+  const { projectId, days = '7' } = req.query as { projectId?: string; days?: string };
+  const data = await getGitHubAnalyticsOverview(projectId, Math.min(Math.max(parseInt(days) || 7, 1), 30));
+  res.json({ success: true, data });
 });
 
 // GET /api/analytics/developer/:id

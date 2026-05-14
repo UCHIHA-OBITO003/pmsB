@@ -35,8 +35,16 @@ router.post('/login', authRateLimiter, async (req, res) => {
 
 router.post('/password-reset/request', authRateLimiter, async (req, res) => {
   const { email } = z.object({ email: z.string().email() }).parse(req.body);
-  await requestPasswordResetOtp(email);
-  res.json({ success: true, message: 'If an account exists, a reset code has been sent.' });
+  const result = await requestPasswordResetOtp(email);
+  res.json({
+    success: true,
+    message: 'If an account exists, a reset code has been sent.',
+    data: {
+      expiresInMinutes: result.expiresInMinutes ?? 15,
+      resendCooldownSeconds: result.resendCooldownSeconds ?? 60,
+      queued: result.queued ?? true,
+    },
+  });
 });
 
 router.post('/password-reset/confirm', authRateLimiter, async (req, res) => {

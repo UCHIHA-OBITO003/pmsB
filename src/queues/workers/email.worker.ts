@@ -3,26 +3,30 @@ import { redis } from '../../utils/redis';
 import { logger } from '../../utils/logger';
 import { EmailJobData } from '../index';
 import { sendHtmlEmail } from '../../services/email.service';
+import { markEmailDeliveryResult, markEmailDeliverySkipped } from '../../services/email-dispatch.service';
 
 let worker: Worker<EmailJobData> | null = null;
 
 async function processEmailJob(job: Job<EmailJobData>) {
-  const { to, subject, html, text } = job.data;
-  logger.info({ jobId: job.id, to, subject }, 'email-worker: sending email');
+  const { deliveryId, to, subject, html, text, templateKey, eventType } = job.data;
+  logger.info({ jobId: job.id, deliveryId, to, subject, templateKey, eventType }, 'email-worker: sending email');
 
   const result = await sendHtmlEmail(to, subject, html, text);
 
   if (!result.ok) {
     if (result.reason === 'no_transport') {
       // SMTP is unconfigured — don't retry, just log and discard
-      logger.warn({ jobId: job.id, to, subject }, 'email-worker: no SMTP transport, discarding job');
+      await markEmailDeliverySkipped(deliveryId, 'No SMTP transport configured');
+      logger.warn({ jobId: job.id, deliveryId, to, subject }, 'email-worker: no SMTP transport, discarding job');
       return { skipped: true, reason: 'no_transport' };
     }
+    await markEmailDeliveryResult({ deliveryId, ok: false, detail: result.detail });
     // SMTP error — let BullMQ retry according to the queue's backoff policy
     throw new Error(`SMTP error: ${result.detail ?? 'unknown'}`);
   }
 
-  logger.info({ jobId: job.id, to, messageId: result.messageId }, 'email-worker: email accepted by SMTP');
+  await markEmailDeliveryResult({ deliveryId, ok: true, messageId: result.messageId });
+  logger.info({ jobId: job.id, deliveryId, to, messageId: result.messageId }, 'email-worker: email accepted by SMTP');
   return { ok: true, messageId: result.messageId };
 }
 

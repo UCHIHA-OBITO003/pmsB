@@ -7,6 +7,7 @@ import { smtpCredentialsPresent } from './email.service';
 import { CRON_MANIFEST } from '../crons/definitions';
 import { getApiHitsSnapshot } from '../utils/api-request-metrics';
 import { getQueueMetrics } from '../queues/index';
+import { githubAppConfigured } from './github-auth.service';
 
 function formatCronEntries() {
   return CRON_MANIFEST.map((row) => ({
@@ -30,6 +31,10 @@ function cronHumanHint(schedule: string): string {
       return 'Every 30 minutes';
     case '0 * * * *':
       return 'Every hour';
+    case '0 8 * * *':
+      return 'Daily at 08:00 (server TZ)';
+    case '30 8 * * *':
+      return 'Daily at 08:30 (server TZ)';
     default:
       return schedule;
   }
@@ -50,6 +55,106 @@ async function postgresDbFootprint(): Promise<{ bytes: number | string; pretty?:
     };
   } catch {
     return null;
+  }
+}
+
+async function getEmailOverview() {
+  try {
+    const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const [statusCounts, latest, failures] = await Promise.all([
+      prisma.emailDelivery.groupBy({
+        by: ['status'],
+        _count: { _all: true },
+        where: { queuedAt: { gte: since24h } },
+      }),
+      prisma.emailDelivery.findMany({
+        orderBy: { queuedAt: 'desc' },
+        take: 8,
+        select: {
+          to: true,
+          templateKey: true,
+          eventType: true,
+          status: true,
+          queuedAt: true,
+          sentAt: true,
+          errorDetail: true,
+        },
+      }),
+      prisma.emailDelivery.findMany({
+        where: { status: { in: ['FAILED', 'SKIPPED'] } },
+        orderBy: { queuedAt: 'desc' },
+        take: 5,
+        select: {
+          to: true,
+          eventType: true,
+          status: true,
+          queuedAt: true,
+          errorDetail: true,
+        },
+      }),
+    ]);
+
+    return {
+      available: true as const,
+      countsLast24h: Object.fromEntries(statusCounts.map((row) => [row.status, row._count._all])),
+      latest,
+      failures,
+      note: 'Statuses are backed by email_deliveries and BullMQ worker updates.',
+    };
+  } catch (error) {
+    return {
+      available: false as const,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+async function getGitHubOverview() {
+  try {
+    const [installations, links, recentFailures] = await Promise.all([
+      prisma.gitHubInstallation.count(),
+      prisma.projectGitHubLink.findMany({
+        orderBy: { updatedAt: 'desc' },
+        take: 8,
+        select: {
+          projectId: true,
+          repositoryFullName: true,
+          status: true,
+          lastSyncStatus: true,
+          lastSyncedAt: true,
+          lastSyncError: true,
+          project: {
+            select: {
+              githubProjectTitle: true,
+            },
+          },
+        },
+      }),
+      prisma.projectGitHubLink.findMany({
+        where: { lastSyncStatus: 'FAILED' },
+        orderBy: { updatedAt: 'desc' },
+        take: 5,
+        select: {
+          repositoryFullName: true,
+          lastSyncError: true,
+          updatedAt: true,
+        },
+      }),
+    ]);
+
+    return {
+      available: true as const,
+      configured: githubAppConfigured(),
+      installationCount: installations,
+      links,
+      recentFailures,
+    };
+  } catch (error) {
+    return {
+      available: false as const,
+      configured: githubAppConfigured(),
+      error: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 
@@ -78,6 +183,8 @@ export async function buildSystemOverview() {
 
   const dbFootprint = await postgresDbFootprint();
   const codemagenEnabled = await getCodemagenEnabled();
+  const emailOverview = await getEmailOverview();
+  const githubOverview = await getGitHubOverview();
 
   let externalSyncJobsByStatus: Record<string, number> = {};
   try {
@@ -121,8 +228,10 @@ export async function buildSystemOverview() {
       smtp: {
         credentialsConfigured: smtpCredentialsPresent(),
         emailPipeline:
-          'Mail is sent inside API handlers (nodemailer). There is no mail queue depth to show — use SMTP result toasts when saving users or check Render logs.',
+          'Transactional mail is queued through BullMQ, rendered by shared template builders, and logged in email_deliveries.',
+        deliveries: emailOverview,
       },
+      github: githubOverview,
     },
     api: {
       requestsSinceBoot: apiHits.count,
@@ -141,7 +250,7 @@ export async function buildSystemOverview() {
           driver: 'BullMQ (Redis-backed)',
           workersActive: true,
           metrics: queueMetrics,
-          note: 'import-job: sheet + file imports. email-job: SMTP. legacy-sync-job: Codemagen re-scrape queue. Completed/failed counts reset on restart (removeOnComplete/removeOnFail limits apply).',
+          note: 'import-job: sheet + file imports. email-job: SMTP. legacy-sync-job: Codemagen re-scrape queue. github-job: GitHub repo/project sync. Completed/failed counts reset on restart (removeOnComplete/removeOnFail limits apply).',
         }
       : {
           driver: 'BullMQ (Redis-backed)',

@@ -2,8 +2,13 @@ import cron from 'node-cron';
 import { logger } from '../utils/logger';
 import { prisma } from '../utils/prisma';
 import { CRON_MANIFEST } from './definitions';
+import { sendDailyTicketDigests } from '../services/ticket-notification.service';
+import { enqueueGitHubProjectSync } from '../queues';
+import { generateGitHubDailySummaries } from '../services/github.service';
+import { sendScheduledOwnerAnalyticsReports } from '../services/owner-analytics-report.service';
 
-const [cronDevDaily, cronSheetSync, cronBottleneck] = CRON_MANIFEST;
+const [cronDevDaily, cronSheetSync, cronBottleneck, cronTicketDigest, cronGitHubSync, cronGitHubSummary, cronOwnerAnalytics] =
+  CRON_MANIFEST;
 
 export function startCrons() {
   // Daily developer metrics — runs at 2 AM
@@ -51,6 +56,63 @@ export function startCrons() {
       await detectBottlenecks();
     } catch (err) {
       logger.error({ err }, 'Bottleneck detection failed');
+    }
+  });
+
+  cron.schedule(cronTicketDigest.schedule, async () => {
+    const { config } = await import('../utils/config');
+    if (!config.features.email) return;
+
+    logger.info('Running daily ticket email digest cron');
+    try {
+      await sendDailyTicketDigests();
+    } catch (err) {
+      logger.error({ err }, 'Daily ticket email digest cron failed');
+    }
+  });
+
+  cron.schedule(cronGitHubSync.schedule, async () => {
+    const { config } = await import('../utils/config');
+    if (!config.features.github) return;
+
+    logger.info('Running GitHub project sync cron');
+    try {
+      const links = await prisma.projectGitHubLink.findMany({
+        where: { status: 'ACTIVE', syncEnabled: true },
+        select: { id: true },
+      });
+      for (const link of links) {
+        await enqueueGitHubProjectSync({
+          type: 'sync-project-link',
+          projectGitHubLinkId: link.id,
+        }).catch(() => {});
+      }
+    } catch (err) {
+      logger.error({ err }, 'GitHub project sync cron failed');
+    }
+  });
+
+  cron.schedule(cronGitHubSummary.schedule, async () => {
+    const { config } = await import('../utils/config');
+    if (!config.features.github) return;
+
+    logger.info('Running GitHub daily summary cron');
+    try {
+      await generateGitHubDailySummaries(new Date());
+    } catch (err) {
+      logger.error({ err }, 'GitHub daily summary cron failed');
+    }
+  });
+
+  cron.schedule(cronOwnerAnalytics.schedule, async () => {
+    const { config } = await import('../utils/config');
+    if (!config.features.email) return;
+
+    logger.info('Running owner analytics report cron');
+    try {
+      await sendScheduledOwnerAnalyticsReports(new Date());
+    } catch (err) {
+      logger.error({ err }, 'Owner analytics report cron failed');
     }
   });
 

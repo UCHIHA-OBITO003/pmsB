@@ -7,9 +7,13 @@ import { AppError } from '../middleware/errorHandler';
 import bcrypt from 'bcryptjs';
 import { sendWelcomeCredentialsEmail, sendAdminProfileNotificationEmail } from '../services/user-mail.service';
 import { mergeUsersIntoTarget } from '../services/user-merge.service';
-import { emailDeliveryForClient, smtpCredentialsPresent, EmailSendResult } from '../services/email.service';
+import { smtpCredentialsPresent } from '../services/email.service';
+import type { QueueEmailResult } from '../services/email-dispatch.service';
 import { logger } from '../utils/logger';
 import { applyCodemagenUserVisibility, getCodemagenEnabled } from '../utils/system-settings';
+import { enqueueGitHubIdentityRemap } from '../queues';
+import { deleteUserGitHubIdentity, listUserGitHubSuggestions, upsertUserGitHubIdentity } from '../services/github.service';
+import { resolveOwnerAnalyticsWindow, sendOwnerAnalyticsReport } from '../services/owner-analytics-report.service';
 
 type UserRowPlain = NonNullable<Awaited<ReturnType<typeof prisma.user.findFirst>>>;
 
@@ -54,12 +58,13 @@ async function notifyAdminUserPatchEmail(args: {
   profileFields: Record<string, unknown>;
   nextEmailRaw: string | undefined;
   newPassword: string | undefined;
-}): Promise<EmailSendResult> {
+}): Promise<QueueEmailResult> {
   const { user, before, profileFields, nextEmailRaw, newPassword } = args;
 
   const lines = patchNotifyLines({ user, before, profileFields, nextEmailRaw, newPassword });
 
   const notifyResult = await sendAdminProfileNotificationEmail({
+    userId: user.id,
     to: user.email,
     firstName: user.firstName,
     lines,
@@ -67,11 +72,8 @@ async function notifyAdminUserPatchEmail(args: {
     newPasswordPlain: newPassword,
   });
 
-  if (!notifyResult.ok) {
-    logger.error(
-      { userId: user.id, email: user.email, reason: notifyResult.reason, detail: notifyResult.detail },
-      'Admin profile notification email delivery failed',
-    );
+  if (!notifyResult.queued) {
+    logger.warn({ userId: user.id, email: user.email, reason: notifyResult.reason }, 'Admin profile notification email not queued');
   }
   return notifyResult;
 }
@@ -98,6 +100,29 @@ const AdminUserPatchSchema = z.object({
 });
 
 const PatchUserBodySchema = UpdateUserSchema.merge(AdminUserPatchSchema);
+const GitHubIdentityBodySchema = z.object({
+  githubUserId: z.string().min(1),
+  login: z.string().min(1),
+  displayName: z.string().optional().nullable(),
+  primaryEmail: z.union([z.string().email(), z.literal('')]).optional().nullable(),
+  avatarUrl: z.union([z.string().url(), z.literal('')]).optional().nullable(),
+  profileUrl: z.union([z.string().url(), z.literal('')]).optional().nullable(),
+  source: z.enum(['MANUAL', 'AUTO', 'EMAIL', 'WEBHOOK']).optional(),
+  remapProjectId: z.string().uuid().optional(),
+  remapLookbackDays: z.number().int().min(1).max(365).optional(),
+  remapNow: z.boolean().optional(),
+});
+
+const OwnerReportSettingsSchema = z.object({
+  ownerAnalyticsEnabled: z.boolean(),
+  ownerAnalyticsCadence: z.enum(['DAILY', 'WEEKLY', 'MONTHLY', 'CUSTOM']),
+  ownerAnalyticsLookbackDays: z.number().int().min(1).max(365).optional().nullable(),
+});
+
+const OwnerReportSendSchema = z.object({
+  window: z.enum(['daily', 'weekly', 'monthly', 'custom']).optional(),
+  lookbackDays: z.number().int().min(1).max(365).optional(),
+});
 
 const CreateUserSchema = z.object({
   email: z.string().email(),
@@ -174,6 +199,7 @@ router.get('/me', async (req: AuthRequest, res) => {
       lastLogin: true,
       createdAt: true,
       roles: { select: { role: { select: { id: true, name: true } } } },
+      githubIdentity: true,
     },
   });
   if (!user) throw new AppError(404, 'User not found', 'NOT_FOUND');
@@ -232,6 +258,15 @@ router.get('/', requirePermission('users', 'read'), async (req, res) => {
         skills: true, status: true, lastLogin: true, createdAt: true,
         roles: { select: { role: { select: { id: true, name: true } } } },
         scorecard: { select: { totalScore: true, band: true } },
+        githubIdentity: true,
+        emailPreferences: {
+          select: {
+            ownerAnalyticsEnabled: true,
+            ownerAnalyticsCadence: true,
+            ownerAnalyticsLookbackDays: true,
+            lastOwnerAnalyticsSentAt: true,
+          },
+        },
       },
       orderBy: { createdAt: 'desc' },
       skip,
@@ -287,20 +322,16 @@ router.post('/', requireRole('admin'), async (req: AuthRequest, res) => {
     },
   });
 
-  let welcomeEmailDelivery: ReturnType<typeof emailDeliveryForClient> | undefined;
   if (data.sendWelcomeEmail) {
     const r = await sendWelcomeCredentialsEmail({
+      userId: user.id,
       to: user.email,
       firstName: user.firstName,
       email: user.email,
       temporaryPassword: plainPassword,
     });
-    welcomeEmailDelivery = emailDeliveryForClient(r);
-    if (!r.ok) {
-      logger.error(
-        { userId: user.id, email: user.email, reason: r.reason, detail: r.detail },
-        'Welcome email delivery failed',
-      );
+    if (!r.queued) {
+      logger.warn({ userId: user.id, email: user.email, reason: r.reason }, 'Welcome email not queued');
     }
   }
 
@@ -311,7 +342,6 @@ router.post('/', requireRole('admin'), async (req: AuthRequest, res) => {
       temporaryPassword: data.sendWelcomeEmail ? undefined : plainPassword,
       welcomeEmailQueued: data.sendWelcomeEmail,
       smtpConfigured: smtpCredentialsPresent(),
-      ...(welcomeEmailDelivery !== undefined ? { emailDelivery: welcomeEmailDelivery } : {}),
     },
   });
 });
@@ -329,6 +359,42 @@ router.post('/merge', requireRole('admin'), async (req: AuthRequest, res) => {
   res.json({ success: true, data: result });
 });
 
+router.patch('/:id/github-identity', requireRole('admin'), async (req: AuthRequest, res) => {
+  const body = GitHubIdentityBodySchema.parse(req.body ?? {});
+  const exists = await prisma.user.findFirst({ where: { id: req.params.id, deletedAt: null }, select: { id: true } });
+  if (!exists) throw new AppError(404, 'User not found', 'NOT_FOUND');
+
+  const data = await upsertUserGitHubIdentity({
+    userId: req.params.id,
+    githubUserId: body.githubUserId,
+    login: body.login,
+    displayName: body.displayName ?? null,
+    primaryEmail: body.primaryEmail || null,
+    avatarUrl: body.avatarUrl || null,
+    profileUrl: body.profileUrl || null,
+    source: body.source ?? 'MANUAL',
+  });
+
+  let remapQueued = false;
+  if (body.remapNow && body.remapProjectId) {
+    await enqueueGitHubIdentityRemap({
+      type: 'remap-project-identity',
+      projectId: body.remapProjectId,
+      userId: req.params.id,
+      requestedBy: req.user?.id,
+      lookbackDays: body.remapLookbackDays,
+    });
+    remapQueued = true;
+  }
+
+  res.json({ success: true, data: { ...data, remapQueued } });
+});
+
+router.delete('/:id/github-identity', requireRole('admin'), async (req, res) => {
+  await deleteUserGitHubIdentity(req.params.id);
+  res.json({ success: true, message: 'GitHub identity removed' });
+});
+
 // POST /api/users/admin/merge — alias (plan-aligned path)
 router.post('/admin/merge', requireRole('admin'), async (req: AuthRequest, res) => {
   const { survivorId, mergeIds } = z
@@ -342,6 +408,74 @@ router.post('/admin/merge', requireRole('admin'), async (req: AuthRequest, res) 
   res.json({ success: true, data: result });
 });
 
+router.get('/:id/github-suggestions', requireRole('admin'), async (req, res) => {
+  const query = z
+    .object({
+      projectId: z.string().uuid().optional(),
+      days: z.coerce.number().int().min(1).max(365).optional(),
+    })
+    .parse(req.query ?? {});
+
+  const data = await listUserGitHubSuggestions(req.params.id, {
+    projectId: query.projectId,
+    days: query.days,
+  });
+  res.json({ success: true, data });
+});
+
+router.patch('/:id/owner-report-settings', requireRole('admin'), async (req, res) => {
+  const body = OwnerReportSettingsSchema.parse(req.body ?? {});
+  const user = await prisma.user.findFirst({
+    where: { id: req.params.id, deletedAt: null },
+    select: { id: true },
+  });
+  if (!user) throw new AppError(404, 'User not found', 'NOT_FOUND');
+
+  const data = await prisma.userEmailPreference.upsert({
+    where: { userId: req.params.id },
+    create: {
+      userId: req.params.id,
+      ownerAnalyticsEnabled: body.ownerAnalyticsEnabled,
+      ownerAnalyticsCadence: body.ownerAnalyticsCadence,
+      ownerAnalyticsLookbackDays: body.ownerAnalyticsCadence === 'CUSTOM' ? body.ownerAnalyticsLookbackDays ?? 14 : null,
+    },
+    update: {
+      ownerAnalyticsEnabled: body.ownerAnalyticsEnabled,
+      ownerAnalyticsCadence: body.ownerAnalyticsCadence,
+      ownerAnalyticsLookbackDays: body.ownerAnalyticsCadence === 'CUSTOM' ? body.ownerAnalyticsLookbackDays ?? 14 : null,
+    },
+    select: {
+      ownerAnalyticsEnabled: true,
+      ownerAnalyticsCadence: true,
+      ownerAnalyticsLookbackDays: true,
+      lastOwnerAnalyticsSentAt: true,
+    },
+  });
+
+  res.json({ success: true, data });
+});
+
+router.post('/:id/owner-analytics-report', requireRole('admin'), async (req, res) => {
+  const body = OwnerReportSendSchema.parse(req.body ?? {});
+  const cadence = body.window ?? 'daily';
+  const window = resolveOwnerAnalyticsWindow({
+    cadence,
+    lookbackDays: cadence === 'custom' ? body.lookbackDays ?? 14 : undefined,
+  });
+  const { report, queue } = await sendOwnerAnalyticsReport(req.params.id, { window, source: 'manual' });
+
+  res.json({
+    success: true,
+    data: {
+      queued: queue.queued,
+      reason: queue.queued ? undefined : queue.reason,
+      smtpConfigured: queue.smtpConfigured,
+      windowLabel: report.window.label,
+      totals: report.totals,
+    },
+  });
+});
+
 // GET /api/users/:id
 router.get('/:id', requirePermission('users', 'read'), async (req, res) => {
   const user = await prisma.user.findFirst({
@@ -353,6 +487,8 @@ router.get('/:id', requirePermission('users', 'read'), async (req, res) => {
       roles: { include: { role: { include: { permissions: { include: { permission: true } } } } } },
       scorecard: true,
       availability: { orderBy: { date: 'desc' }, take: 30 },
+      githubIdentity: true,
+      emailPreferences: true,
     },
   });
 
@@ -459,7 +595,6 @@ router.patch('/:id', requirePermission('users', 'update'), async (req: AuthReque
     | {
         notifyEmailQueued: true;
         smtpConfigured: boolean;
-        emailDelivery: ReturnType<typeof emailDeliveryForClient>;
       }
     | undefined;
 
@@ -475,7 +610,6 @@ router.patch('/:id', requirePermission('users', 'update'), async (req: AuthReque
     notifyMeta = {
       notifyEmailQueued: true,
       smtpConfigured: smtpCredentialsPresent(),
-      emailDelivery: emailDeliveryForClient(notifyResult),
     };
   }
 

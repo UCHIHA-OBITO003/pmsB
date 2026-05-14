@@ -18,4 +18,28 @@ export const CRON_MANIFEST = [
     description: 'Runs bottleneck detection for active work.',
     requiresEnvFlag: null as string | null,
   },
+  {
+    id: 'ticket-email-digest-daily',
+    schedule: '0 8 * * *',
+    description: 'Sends daily ticket activity digests to active users.',
+    requiresEnvFlag: 'ENABLE_EMAIL_NOTIFICATIONS',
+  },
+  {
+    id: 'github-project-sync',
+    schedule: '*/30 * * * *',
+    description: 'Queues GitHub repository/project sync for linked PMS projects.',
+    requiresEnvFlag: 'ENABLE_GITHUB_INTEGRATION',
+  },
+  {
+    id: 'github-daily-summary',
+    schedule: '30 8 * * *',
+    description: 'Builds daily GitHub activity summaries for mapped PMS users.',
+    requiresEnvFlag: 'ENABLE_GITHUB_INTEGRATION',
+  },
+  {
+    id: 'owner-analytics-report',
+    schedule: '45 20 * * *',
+    description: 'Sends scheduled owner analytics reports to opted-in recipients.',
+    requiresEnvFlag: 'ENABLE_EMAIL_NOTIFICATIONS',
+  },
 ] as const;

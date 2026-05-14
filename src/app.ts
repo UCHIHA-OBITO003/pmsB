@@ -32,6 +32,7 @@ import systemRoutes from './routes/system.routes';
 import organisationRoutes from './routes/organisation.routes';
 import companyRoutes from './routes/company.routes';
 import teamRoutes from './routes/team.routes';
+import githubRoutes from './routes/github.routes';
 
 const app = express();
 
@@ -67,6 +68,9 @@ app.use(compression());
 
 // Logging
 app.use(pinoHttp({ logger }));
+
+// GitHub webhooks need the raw body for signature verification.
+app.use('/api/github/webhooks', express.raw({ type: '*/*', limit: '2mb' }));
 
 // Body parsing
 app.use(express.json({ limit: '10mb' }));
@@ -111,6 +115,7 @@ app.use('/api/system', systemRoutes);
 app.use('/api/organisations', organisationRoutes);
 app.use('/api/companies', companyRoutes);
 app.use('/api/teams', teamRoutes);
+app.use('/api/github', githubRoutes);
 app.use('/uploads', express.static(path.resolve(config.upload.dir)));
 
 // Error handler (must be last)

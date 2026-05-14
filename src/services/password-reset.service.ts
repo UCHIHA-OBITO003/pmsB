@@ -2,21 +2,13 @@ import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { prisma } from '../utils/prisma';
 import { AppError } from '../middleware/errorHandler';
-import { sendHtmlEmail } from './email.service';
-import { config } from '../utils/config';
 import { logger } from '../utils/logger';
+import { enqueueTransactionalEmail } from './email-dispatch.service';
+import { buildPasswordResetOtpEmail } from './email-templates/auth-email.templates';
 
 const PURPOSE = 'password_reset';
 const OTP_TTL_MS = 15 * 60 * 1000;
 const MAX_ATTEMPTS = 5;
-
-function escapeHtml(s: string) {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
 
 function generateOtp(): string {
   return String(crypto.randomInt(100000, 1000000));
@@ -43,24 +35,24 @@ export async function requestPasswordResetOtp(emailRaw: string) {
     },
   });
 
-  const resetUrl = `${config.app.baseUrl}/reset-password?email=${encodeURIComponent(email)}`;
-  const subject = `Your ${config.app.baseUrl.replace(/^https?:\/\//, '')} password reset code`;
-  const text = `Hello ${user.firstName},\n\nYour one-time code: ${otp}\n\nIt expires in 15 minutes.\n\nReset page: ${resetUrl}\n`;
-  const html = `<p>Hello <strong>${escapeHtml(user.firstName)}</strong>,</p>
-<p>Your one-time password reset code:</p>
-<p style="font-size:24px;font-weight:bold;letter-spacing:4px">${otp}</p>
-<p>This code expires in <strong>15 minutes</strong>.</p>
-<p><a href="${resetUrl}">Open reset page</a></p>
-<p>If you did not request this, ignore this email.</p>`;
-
-  const mail = await sendHtmlEmail(user.email, subject, html, text);
-  if (!mail.ok) {
-    logger.error(
-      { email, reason: mail.reason, detail: mail.detail },
-      'Password reset OTP email not delivered — check SMTP / spam / EMAIL_FROM vs SMTP_USER',
-    );
+  const template = buildPasswordResetOtpEmail({
+    firstName: user.firstName,
+    email,
+    otp,
+  });
+  const queue = await enqueueTransactionalEmail({
+    userId: user.id,
+    to: user.email,
+    template,
+    eventType: 'PASSWORD_RESET_OTP',
+    resourceType: 'user',
+    resourceId: user.id,
+    fingerprint: `password-reset:${user.id}:${otp}`,
+  });
+  if (!queue.queued) {
+    logger.warn({ email, reason: queue.reason }, 'Password reset OTP email skipped');
   }
-  return { ok: true as const };
+  return { ok: true as const, queued: queue.queued, expiresInMinutes: 15, resendCooldownSeconds: 60 };
 }
 
 export async function verifyOtpAndResetPassword(emailRaw: string, otp: string, newPassword: string) {

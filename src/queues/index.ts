@@ -49,10 +49,17 @@ export const importQueue = new Queue<ImportJobData>('import-job', {
 // ─── Email queue ──────────────────────────────────────────────────────────────
 
 export type EmailJobData = {
+  deliveryId: string;
+  userId?: string;
   to: string;
   subject: string;
   html: string;
   text: string;
+  templateKey: string;
+  eventType: string;
+  resourceType?: string;
+  resourceId?: string;
+  metadata?: Record<string, unknown>;
 };
 
 export const emailQueue = new Queue<EmailJobData>('email-job', {
@@ -62,6 +69,32 @@ export const emailQueue = new Queue<EmailJobData>('email-job', {
     backoff: { type: 'exponential', delay: 10_000 },
     removeOnComplete: { count: 50 },
     removeOnFail: { count: 100 },
+  },
+});
+
+// ─── GitHub sync queue ─────────────────────────────────────────────────────────
+
+export type GitHubJobData = {
+  type: 'sync-project-link';
+  projectGitHubLinkId: string;
+  forceFull?: boolean;
+  lookbackDays?: number;
+  requestedBy?: string;
+} | {
+  type: 'remap-project-identity';
+  projectId: string;
+  userId: string;
+  lookbackDays?: number;
+  requestedBy?: string;
+};
+
+export const githubQueue = new Queue<GitHubJobData>('github-job', {
+  connection: redis,
+  defaultJobOptions: {
+    attempts: 4,
+    backoff: { type: 'exponential', delay: 20_000 },
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 200 },
   },
 });
 
@@ -97,6 +130,21 @@ export async function enqueueEmail(data: EmailJobData) {
   return emailQueue.add('send-email', data);
 }
 
+export async function enqueueGitHubProjectSync(data: GitHubJobData) {
+  if (data.type !== 'sync-project-link') {
+    throw new Error('enqueueGitHubProjectSync only supports sync-project-link jobs');
+  }
+  return githubQueue.add('sync-project-link', data, {
+    jobId: `${data.projectGitHubLinkId}--${data.forceFull ? 'full' : 'delta'}--${data.lookbackDays ?? 'auto'}`,
+  });
+}
+
+export async function enqueueGitHubIdentityRemap(data: Extract<GitHubJobData, { type: 'remap-project-identity' }>) {
+  return githubQueue.add('remap-project-identity', data, {
+    jobId: `${data.projectId}--${data.userId}--remap--${data.lookbackDays ?? 'auto'}`,
+  });
+}
+
 /** Enqueue Codemagen legacy sync jobs for many ticket IDs (returns BullMQ job ids). */
 export async function enqueueLegacySyncJobs(ticketIds: string[]) {
   const jobs = await Promise.all(
@@ -107,14 +155,16 @@ export async function enqueueLegacySyncJobs(ticketIds: string[]) {
 
 /** Snapshot of queue metrics for the system overview endpoint. */
 export async function getQueueMetrics() {
-  const [importCounts, emailCounts, legacyCounts] = await Promise.all([
+  const [importCounts, emailCounts, legacyCounts, githubCounts] = await Promise.all([
     importQueue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed'),
     emailQueue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed'),
     legacySyncQueue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed'),
+    githubQueue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed'),
   ]);
   return {
     'import-job': importCounts,
     'email-job': emailCounts,
     'legacy-sync-job': legacyCounts,
+    'github-job': githubCounts,
   };
 }

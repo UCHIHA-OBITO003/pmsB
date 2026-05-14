@@ -241,6 +241,66 @@ export async function mergeUsersIntoTarget(
     });
     stats.notificationsMoved += notifCount;
 
+    // 14b. GitHub identity, mapped events, and daily summaries
+    const sourceGitHubIdentity = await prisma.userGitHubIdentity.findUnique({
+      where: { userId: sourceId },
+    });
+    if (sourceGitHubIdentity) {
+      const targetGitHubIdentity = await prisma.userGitHubIdentity.findUnique({
+        where: { userId: targetId },
+      });
+      if (!targetGitHubIdentity) {
+        await prisma.userGitHubIdentity.update({
+          where: { userId: sourceId },
+          data: { userId: targetId },
+        });
+      } else {
+        await prisma.userGitHubIdentity.delete({ where: { userId: sourceId } }).catch(() => {});
+      }
+    }
+    await prisma.gitHubActivityEvent.updateMany({
+      where: { mappedUserId: sourceId },
+      data: { mappedUserId: targetId },
+    });
+
+    const sourceGitHubSummaries = await prisma.gitHubDailySummary.findMany({
+      where: { userId: sourceId },
+    });
+    for (const summary of sourceGitHubSummaries) {
+      const twin = await prisma.gitHubDailySummary.findUnique({
+        where: {
+          projectId_userId_date: {
+            projectId: summary.projectId,
+            userId: targetId,
+            date: summary.date,
+          },
+        },
+      });
+      if (twin) {
+        await prisma.gitHubDailySummary.update({
+          where: { id: twin.id },
+          data: {
+            commits: twin.commits + summary.commits,
+            pullRequestsOpened: twin.pullRequestsOpened + summary.pullRequestsOpened,
+            pullRequestsMerged: twin.pullRequestsMerged + summary.pullRequestsMerged,
+            reviewsSubmitted: twin.reviewsSubmitted + summary.reviewsSubmitted,
+            issuesUpdated: twin.issuesUpdated + summary.issuesUpdated,
+            checksPassed: twin.checksPassed + summary.checksPassed,
+            checksFailed: twin.checksFailed + summary.checksFailed,
+            projectItemsMoved: twin.projectItemsMoved + summary.projectItemsMoved,
+            summary: [twin.summary, summary.summary].filter(Boolean).join(' '),
+            plannedNext: [twin.plannedNext, summary.plannedNext].filter(Boolean).join(' '),
+          },
+        });
+        await prisma.gitHubDailySummary.delete({ where: { id: summary.id } });
+      } else {
+        await prisma.gitHubDailySummary.update({
+          where: { id: summary.id },
+          data: { userId: targetId },
+        });
+      }
+    }
+
     // 15. Timesheets
     const tsRows = await prisma.timesheet.findMany({ where: { userId: sourceId } });
     for (const ts of tsRows) {

@@ -9,6 +9,10 @@ function normalizeOrigin(raw: string): string {
   return raw.trim().replace(/^['"]|['"]$/g, '').replace(/\/$/, '');
 }
 
+function normalizeMultilineSecret(raw: string | undefined): string {
+  return (raw || '').replace(/\\n/g, '\n').trim();
+}
+
 /** Upstash / Render: paste only `rediss://...` or `redis://...`, not `redis-cli --tls -u ...` */
 function normalizeRedisUrl(raw: string | undefined): string {
   const fallback = 'redis://localhost:6379';
@@ -63,6 +67,18 @@ export const config = {
     openaiModel: process.env.OPENAI_MODEL || 'gpt-4o',
   },
 
+  github: {
+    appId: (process.env.GITHUB_APP_ID || '').trim(),
+    appSlug: (process.env.GITHUB_APP_SLUG || '').trim(),
+    clientId: (process.env.GITHUB_CLIENT_ID || '').trim(),
+    clientSecret: (process.env.GITHUB_CLIENT_SECRET || '').trim(),
+    privateKey: normalizeMultilineSecret(process.env.GITHUB_PRIVATE_KEY),
+    webhookSecret: (process.env.GITHUB_WEBHOOK_SECRET || '').trim(),
+    installationUrl:
+      (process.env.GITHUB_APP_INSTALL_URL || 'https://github.com/apps').trim().replace(/\/$/, ''),
+    apiBaseUrl: (process.env.GITHUB_API_BASE_URL || 'https://api.github.com').trim().replace(/\/$/, ''),
+  },
+
   email: {
     host: process.env.SMTP_HOST || 'smtp.gmail.com',
     port: parseInt(process.env.SMTP_PORT || '587', 10),
@@ -109,6 +125,7 @@ export const config = {
     ai: process.env.ENABLE_AI_FEATURES === 'true',
     googleSheets: process.env.ENABLE_GOOGLE_SHEETS_SYNC === 'true',
     email: process.env.ENABLE_EMAIL_NOTIFICATIONS === 'true',
+    github: process.env.ENABLE_GITHUB_INTEGRATION === 'true',
   },
 
   /** Project `key` used when sheet rows reference Codemagen issues (e.g. EEP). */

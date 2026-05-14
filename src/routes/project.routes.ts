@@ -11,6 +11,15 @@ import {
   getCodemagenEnabled,
 } from '../utils/system-settings';
 import { emitBoardEvent } from '../services/board-events.service';
+import { enqueueGitHubProjectSync } from '../queues';
+import {
+  deleteProjectGitHubLink,
+  getProjectGitHubActivity,
+  getProjectGitHubMembers,
+  getProjectGitHubOverview,
+  saveProjectGitHubLink,
+  updateProjectGitHubBoard,
+} from '../services/github.service';
 
 const router = Router();
 router.use(authenticate);
@@ -111,6 +120,17 @@ router.get('/:id', requirePermission('projects', 'read'), async (req, res) => {
       sprints: { where: { status: 'ACTIVE' }, take: 1 },
       _count: { select: { tickets: true, sprints: true, members: true } },
       workflowStates: { orderBy: { order: 'asc' } },
+      githubLinks: {
+        orderBy: { createdAt: 'asc' },
+        include: {
+          installation: {
+            select: { id: true, accountLogin: true, accountType: true, githubInstallationId: true },
+          },
+        },
+      },
+      githubBoardInstallation: {
+        select: { id: true, accountLogin: true, accountType: true, githubInstallationId: true },
+      },
     },
   });
 
@@ -127,6 +147,124 @@ router.get('/:id', requirePermission('projects', 'read'), async (req, res) => {
       members: filterVisibleMembershipUsers(project.members, codemagenEnabled),
     },
   });
+});
+
+const ProjectGitHubLinkSchema = z.object({
+  installationId: z.string().uuid(),
+  ownerLogin: z.string().min(1),
+  ownerType: z.enum(['USER', 'ORGANIZATION']).optional(),
+  repositoryId: z.string().min(1),
+  repositoryNodeId: z.string().optional().nullable(),
+  repositoryName: z.string().min(1),
+  repositoryFullName: z.string().min(1),
+  defaultBranch: z.string().optional().nullable(),
+});
+
+const ProjectGitHubBoardSchema = z.object({
+  installationId: z.string().uuid().optional().nullable(),
+  ownerLogin: z.string().min(1).optional().nullable(),
+  ownerType: z.enum(['USER', 'ORGANIZATION']).optional().nullable(),
+  githubProjectId: z.string().optional().nullable(),
+  githubProjectNumber: z.number().int().optional().nullable(),
+  githubProjectTitle: z.string().optional().nullable(),
+});
+
+const ProjectGitHubSyncSchema = z.object({
+  forceFull: z.boolean().optional(),
+  linkId: z.string().uuid().optional(),
+  lookbackDays: z.number().int().min(1).max(365).optional(),
+});
+
+router.get('/:id/github', requirePermission('projects', 'read'), async (req, res) => {
+  const data = await getProjectGitHubOverview(req.params.id);
+  res.json({ success: true, data });
+});
+
+router.get('/:id/github/activity', requirePermission('projects', 'read'), async (req, res) => {
+  const { limit = '40' } = req.query as { limit?: string };
+  const data = await getProjectGitHubActivity(req.params.id, Math.min(parseInt(limit) || 40, 200));
+  res.json({ success: true, data });
+});
+
+router.get('/:id/github/members', requirePermission('projects', 'read'), async (req, res) => {
+  const data = await getProjectGitHubMembers(req.params.id);
+  res.json({ success: true, data });
+});
+
+router.post('/:id/github/link', requirePermission('projects', 'update'), async (req: AuthRequest, res) => {
+  const body = ProjectGitHubLinkSchema.parse(req.body ?? {});
+  const data = await saveProjectGitHubLink({
+    projectId: req.params.id,
+    installationId: body.installationId,
+    ownerLogin: body.ownerLogin,
+    ownerType: body.ownerType,
+    repositoryId: body.repositoryId,
+    repositoryNodeId: body.repositoryNodeId ?? null,
+    repositoryName: body.repositoryName,
+    repositoryFullName: body.repositoryFullName,
+    defaultBranch: body.defaultBranch ?? null,
+    createdBy: req.user?.id,
+  });
+
+  await enqueueGitHubProjectSync({
+    type: 'sync-project-link',
+    projectGitHubLinkId: data.id,
+    requestedBy: req.user?.id,
+    forceFull: true,
+  });
+
+  res.status(201).json({ success: true, data });
+});
+
+router.patch('/:id/github/board', requirePermission('projects', 'update'), async (req, res) => {
+  const body = ProjectGitHubBoardSchema.parse(req.body ?? {});
+  const data = await updateProjectGitHubBoard({
+    projectId: req.params.id,
+    installationId: body.installationId ?? null,
+    ownerLogin: body.ownerLogin ?? null,
+    ownerType: body.ownerType ?? null,
+    githubProjectId: body.githubProjectId ?? null,
+    githubProjectNumber: body.githubProjectNumber ?? null,
+    githubProjectTitle: body.githubProjectTitle ?? null,
+  });
+  res.json({ success: true, data });
+});
+
+router.post('/:id/github/sync', requirePermission('projects', 'update'), async (req: AuthRequest, res) => {
+  const body = ProjectGitHubSyncSchema.parse(req.body ?? {});
+  const links =
+    body.linkId ?
+      await prisma.projectGitHubLink.findMany({
+        where: { id: body.linkId, projectId: req.params.id },
+        select: { id: true },
+      })
+    : await prisma.projectGitHubLink.findMany({
+        where: { projectId: req.params.id },
+        select: { id: true },
+      });
+  if (links.length === 0) throw new AppError(404, 'GitHub link not found for this project', 'GITHUB_LINK_NOT_FOUND');
+
+  await Promise.all(
+    links.map((link) =>
+      enqueueGitHubProjectSync({
+        type: 'sync-project-link',
+        projectGitHubLinkId: link.id,
+        requestedBy: req.user?.id,
+        forceFull: body.forceFull === true,
+        lookbackDays: body.lookbackDays,
+      }),
+    ),
+  );
+
+  res.json({
+    success: true,
+    message: links.length === 1 ? 'GitHub sync queued' : `GitHub sync queued for ${links.length} repositories`,
+  });
+});
+
+router.delete('/:id/github/link/:linkId', requirePermission('projects', 'update'), async (req, res) => {
+  await deleteProjectGitHubLink(req.params.id, req.params.linkId);
+  res.json({ success: true, message: 'GitHub link removed' });
 });
 
 // GET /api/projects/:id/roster-summary — company, org, team, members, ticket counts by source

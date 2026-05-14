@@ -846,7 +846,7 @@ router.patch('/:id', requirePermission('tickets', 'update'), async (req: AuthReq
     where: patchWhere,
     include: {
       assignees: { select: { id: true } },
-      workflowState: { select: { id: true, name: true } },
+      workflowState: { select: { id: true, name: true, isFinal: true } },
     },
   });
   if (!existing) throw new AppError(404, 'Ticket not found', 'NOT_FOUND');
@@ -922,6 +922,7 @@ router.patch('/:id', requirePermission('tickets', 'update'), async (req: AuthReq
     {
       assigneeIdsApplied: assigneeIds,
       previousWorkflowStateName: existing.workflowState?.name ?? null,
+      previousWorkflowStateFinal: existing.workflowState?.isFinal ?? null,
     },
   );
 
@@ -947,7 +948,12 @@ router.post('/:id/comments', requirePermission('tickets', 'update'), async (req:
     data: { ticketId: req.params.id, authorId: req.user!.id, body },
     include: { author: { select: { id: true, firstName: true, lastName: true, avatar: true } } },
   });
-  void notifyTicketComment({ ticketId: req.params.id, actorId: req.user!.id, commentPreview: body });
+  void notifyTicketComment({
+    ticketId: req.params.id,
+    actorId: req.user!.id,
+    commentPreview: body,
+    commentBody: body,
+  });
   res.status(201).json({ success: true, data: comment });
 });
 
