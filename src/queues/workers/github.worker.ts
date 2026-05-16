@@ -1,32 +1,27 @@
 import { Job, Worker } from 'bullmq';
 import { redis } from '../../utils/redis';
 import { logger } from '../../utils/logger';
-import { type GitHubJobData } from '../index';
-import { remapProjectGitHubIdentity, syncProjectGitHubLink } from '../../services/github.service';
+import type { GitHubJobData } from '../job-types';
+import { runGitHubJob } from '../processors/github.processor';
+import { bullWorkerPollOptions, shouldRunBullWorkers } from '../queue-runtime';
 
 let worker: Worker<GitHubJobData> | null = null;
 
 async function processGitHubJob(job: Job<GitHubJobData>) {
-  if (job.data.type === 'sync-project-link') {
-    logger.info({ jobId: job.id, projectGitHubLinkId: job.data.projectGitHubLinkId }, 'github-worker: syncing project link');
-    await syncProjectGitHubLink(job.data.projectGitHubLinkId, Boolean(job.data.forceFull), job.data.lookbackDays);
-    return { ok: true };
-  }
-
-  if (job.data.type === 'remap-project-identity') {
-    logger.info({ jobId: job.id, projectId: job.data.projectId, userId: job.data.userId }, 'github-worker: remapping project identity');
-    return remapProjectGitHubIdentity(job.data.projectId, job.data.userId, job.data.lookbackDays ?? 90);
-  }
-
-  return { skipped: true, reason: 'unknown_job_type' };
+  return runGitHubJob(job.data, { jobId: job.id });
 }
 
 export function startGitHubWorker() {
   if (worker) return worker;
+  if (!shouldRunBullWorkers()) {
+    logger.info('github-worker: skipped (inline queue mode or Redis unavailable)');
+    return null;
+  }
 
   worker = new Worker<GitHubJobData>('github-job', processGitHubJob, {
     connection: redis,
     concurrency: 2,
+    ...bullWorkerPollOptions(),
   });
 
   worker.on('completed', (job) => {

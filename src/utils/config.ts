@@ -60,6 +60,31 @@ export const config = {
     url: normalizeRedisUrl(process.env.REDIS_URL),
   },
 
+  /**
+   * BullMQ / Upstash: workers poll Redis constantly and can exhaust free-tier command quotas.
+   * - QUEUE_MODE=inline — never enqueue to Redis; process jobs in-process (best when quota exceeded).
+   * - DISABLE_BULLMQ_WORKERS=true — do not start workers (use with inline or another worker process).
+   * - REDIS_OPTIONAL=true — API boots even if Redis ping fails (forces inline fallbacks).
+   */
+  queues: {
+    mode: (() => {
+      const raw = (process.env.QUEUE_MODE || '').trim().toLowerCase();
+      if (raw === 'inline' || raw === 'redis') return raw as 'inline' | 'redis';
+      if (envFlag(process.env.DISABLE_REDIS_QUEUES)) return 'inline' as const;
+      return 'redis' as const;
+    })(),
+    workersEnabled: !envFlag(process.env.DISABLE_BULLMQ_WORKERS),
+    redisOptional: envFlag(process.env.REDIS_OPTIONAL) || envFlag(process.env.DISABLE_REDIS_QUEUES),
+    /** Worker stalled check interval — higher = fewer Redis commands (default 2 min in production). */
+    stalledIntervalMs: parseInt(
+      process.env.BULL_STALLED_INTERVAL_MS ||
+        (process.env.NODE_ENV === 'production' ? '120000' : '60000'),
+      10,
+    ),
+    /** Recover QUEUED email rows stuck after Redis outage (cron interval in definitions). */
+    emailDrainBatchSize: parseInt(process.env.EMAIL_DRAIN_BATCH_SIZE || '5', 10),
+  },
+
   ai: {
     anthropicKey: process.env.ANTHROPIC_API_KEY || '',
     claudeModel: process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-20241022',
@@ -86,11 +111,27 @@ export const config = {
     pass: process.env.SMTP_PASS || '',
     from: process.env.EMAIL_FROM || 'noreply@pms.local',
     /** TCP + SMTP greeting; raise on slow cloud egress (ETIMEDOUT during CONN). */
-    connectionTimeoutMs: parseInt(process.env.SMTP_CONNECTION_TIMEOUT_MS || '45000', 10),
-    greetingTimeoutMs: parseInt(process.env.SMTP_GREETING_TIMEOUT_MS || '45000', 10),
+    connectionTimeoutMs: parseInt(
+      process.env.SMTP_CONNECTION_TIMEOUT_MS ||
+        (process.env.NODE_ENV === 'production' ? '90000' : '45000'),
+      10,
+    ),
+    greetingTimeoutMs: parseInt(
+      process.env.SMTP_GREETING_TIMEOUT_MS || (process.env.NODE_ENV === 'production' ? '90000' : '45000'),
+      10,
+    ),
     socketTimeoutMs: parseInt(process.env.SMTP_SOCKET_TIMEOUT_MS || '120000', 10),
     /** Prefer IPv4 when the host resolves to IPv6 that your host cannot route (fixes some ETIMEDOUT on CONN). */
-    forceIpv4: process.env.SMTP_FORCE_IPV4 === 'true',
+    forceIpv4:
+      process.env.SMTP_FORCE_IPV4 === 'true' ||
+      (process.env.NODE_ENV === 'production' && process.env.SMTP_FORCE_IPV4 !== 'false'),
+    /** Limit parallel SMTP jobs — burst sends (owner reports) often time out on PaaS hosts. */
+    workerConcurrency: parseInt(
+      process.env.SMTP_WORKER_CONCURRENCY || (process.env.NODE_ENV === 'production' ? '1' : '3'),
+      10,
+    ),
+    /** Reuse one connection at a time when pooling (reduces Gmail connection storms). */
+    poolMaxConnections: parseInt(process.env.SMTP_POOL_MAX_CONNECTIONS || '1', 10),
   },
 
   google: {

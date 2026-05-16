@@ -9,6 +9,7 @@ import { startImportWorker, stopImportWorker } from './queues/workers/import.wor
 import { startEmailWorker, stopEmailWorker } from './queues/workers/email.worker';
 import { startLegacySyncWorker, stopLegacySyncWorker } from './queues/workers/legacy-sync.worker';
 import { startGitHubWorker, stopGitHubWorker } from './queues/workers/github.worker';
+import { getQueueMode, probeRedis, shouldRunBullWorkers } from './queues/queue-runtime';
 
 async function bootstrap() {
   try {
@@ -16,19 +17,34 @@ async function bootstrap() {
     await prisma.$connect();
     logger.info('✅ PostgreSQL connected');
 
-    // Test Redis connection
-    await redis.ping();
-    logger.info('✅ Redis connected');
+    const redisOk = await probeRedis(redis);
+    if (redisOk) {
+      logger.info('✅ Redis connected');
+    } else if (config.queues.redisOptional || getQueueMode() === 'inline') {
+      logger.warn(
+        { queueMode: getQueueMode() },
+        'Redis unavailable — API will use inline job processing (no BullMQ workers)',
+      );
+    } else {
+      throw new Error('Redis ping failed. Set REDIS_OPTIONAL=true or QUEUE_MODE=inline to start without Redis.');
+    }
 
     // Start scheduled jobs
     startCrons();
     logger.info('✅ Cron jobs started');
 
-    // Mount BullMQ workers (import-job + email-job)
-    startImportWorker();
-    startEmailWorker();
-    startLegacySyncWorker();
-    startGitHubWorker();
+    if (shouldRunBullWorkers()) {
+      startImportWorker();
+      startEmailWorker();
+      startLegacySyncWorker();
+      startGitHubWorker();
+      logger.info('✅ BullMQ workers started');
+    } else {
+      logger.info(
+        { queueMode: getQueueMode(), workersEnabled: config.queues.workersEnabled },
+        'BullMQ workers not started — jobs run inline when enqueued',
+      );
+    }
 
     // Start server
     app.listen(config.port, () => {

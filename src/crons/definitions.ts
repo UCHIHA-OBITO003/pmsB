@@ -42,4 +42,10 @@ export const CRON_MANIFEST = [
     description: 'Sends scheduled owner analytics reports to opted-in recipients.',
     requiresEnvFlag: 'ENABLE_EMAIL_NOTIFICATIONS',
   },
+  {
+    id: 'email-delivery-drain',
+    schedule: '*/10 * * * *',
+    description: 'Sends QUEUED emails stuck when Redis/BullMQ was unavailable.',
+    requiresEnvFlag: 'ENABLE_EMAIL_NOTIFICATIONS',
+  },
 ] as const;

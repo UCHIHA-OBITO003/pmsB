@@ -1,27 +1,25 @@
 import { Worker, Job } from 'bullmq';
 import { redis } from '../../utils/redis';
 import { logger } from '../../utils/logger';
-import { ImportJobData } from '../index';
+import type { ImportJobData } from '../job-types';
+import { bullWorkerPollOptions, shouldRunBullWorkers } from '../queue-runtime';
 
 let worker: Worker<ImportJobData> | null = null;
 
-async function processImportJob(job: Job<ImportJobData>) {
-  const { data } = job;
-  logger.info({ jobId: job.id, type: data.type }, 'import-worker: processing job');
+export async function runImportJobInline(data: ImportJobData) {
+  logger.info({ type: data.type }, 'import: processing inline job');
 
-  // Lazy-import the heavy service modules so they are only loaded when a
-  // worker actually runs, not at queue-definition time.
   if (data.type === 'google-sheet') {
     const { excelImportService } = await import('../../services/excel-import.service');
     const result = await excelImportService.syncGoogleSheet(
       data.sheetId,
       data.projectId,
       data.userId,
-      (data.columnMapping ?? {}) as any,
+      (data.columnMapping ?? {}) as Record<string, string>,
       data.configId,
       { legacyTicketProjectId: data.legacyTicketProjectId },
     );
-    logger.info({ jobId: job.id, result }, 'import-worker: google-sheet sync complete');
+    logger.info({ result }, 'import: google-sheet sync complete');
     return result;
   }
 
@@ -33,19 +31,28 @@ async function processImportJob(job: Job<ImportJobData>) {
       data.columnMapping ?? {},
       data.userId,
     );
-    logger.info({ jobId: job.id, result }, 'import-worker: file import complete');
+    logger.info({ result }, 'import: file import complete');
     return result;
   }
 
-  throw new Error(`import-worker: unknown job type ${(data as any).type}`);
+  throw new Error(`import: unknown job type ${(data as { type: string }).type}`);
+}
+
+async function processImportJob(job: Job<ImportJobData>) {
+  return runImportJobInline(job.data);
 }
 
 export function startImportWorker() {
   if (worker) return worker;
+  if (!shouldRunBullWorkers()) {
+    logger.info('import-worker: skipped (inline queue mode or Redis unavailable)');
+    return null;
+  }
 
   worker = new Worker<ImportJobData>('import-job', processImportJob, {
     connection: redis,
     concurrency: 2,
+    ...bullWorkerPollOptions(),
   });
 
   worker.on('completed', (job) => {

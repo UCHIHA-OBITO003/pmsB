@@ -7,8 +7,16 @@ import { enqueueGitHubProjectSync } from '../queues';
 import { generateGitHubDailySummaries } from '../services/github.service';
 import { sendScheduledOwnerAnalyticsReports } from '../services/owner-analytics-report.service';
 
-const [cronDevDaily, cronSheetSync, cronBottleneck, cronTicketDigest, cronGitHubSync, cronGitHubSummary, cronOwnerAnalytics] =
-  CRON_MANIFEST;
+const [
+  cronDevDaily,
+  cronSheetSync,
+  cronBottleneck,
+  cronTicketDigest,
+  cronGitHubSync,
+  cronGitHubSummary,
+  cronOwnerAnalytics,
+  cronEmailDrain,
+] = CRON_MANIFEST;
 
 export function startCrons() {
   // Daily developer metrics — runs at 2 AM
@@ -113,6 +121,18 @@ export function startCrons() {
       await sendScheduledOwnerAnalyticsReports(new Date());
     } catch (err) {
       logger.error({ err }, 'Owner analytics report cron failed');
+    }
+  });
+
+  cron.schedule(cronEmailDrain.schedule, async () => {
+    const { config } = await import('../utils/config');
+    if (!config.features.email) return;
+
+    try {
+      const { drainStuckQueuedEmailDeliveries } = await import('../services/email-drain.service');
+      await drainStuckQueuedEmailDeliveries();
+    } catch (err) {
+      logger.error({ err }, 'Email delivery drain cron failed');
     }
   });
 

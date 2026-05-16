@@ -1,41 +1,30 @@
 import { Worker, Job } from 'bullmq';
 import { redis } from '../../utils/redis';
 import { logger } from '../../utils/logger';
-import { EmailJobData } from '../index';
-import { sendHtmlEmail } from '../../services/email.service';
-import { markEmailDeliveryResult, markEmailDeliverySkipped } from '../../services/email-dispatch.service';
+import type { EmailJobData } from '../job-types';
+import { config } from '../../utils/config';
+import { runEmailJob } from '../processors/email.processor';
+import { bullWorkerPollOptions, shouldRunBullWorkers } from '../queue-runtime';
 
 let worker: Worker<EmailJobData> | null = null;
 
 async function processEmailJob(job: Job<EmailJobData>) {
-  const { deliveryId, to, subject, html, text, templateKey, eventType } = job.data;
-  logger.info({ jobId: job.id, deliveryId, to, subject, templateKey, eventType }, 'email-worker: sending email');
-
-  const result = await sendHtmlEmail(to, subject, html, text);
-
-  if (!result.ok) {
-    if (result.reason === 'no_transport') {
-      // SMTP is unconfigured — don't retry, just log and discard
-      await markEmailDeliverySkipped(deliveryId, 'No SMTP transport configured');
-      logger.warn({ jobId: job.id, deliveryId, to, subject }, 'email-worker: no SMTP transport, discarding job');
-      return { skipped: true, reason: 'no_transport' };
-    }
-    await markEmailDeliveryResult({ deliveryId, ok: false, detail: result.detail });
-    // SMTP error — let BullMQ retry according to the queue's backoff policy
-    throw new Error(`SMTP error: ${result.detail ?? 'unknown'}`);
-  }
-
-  await markEmailDeliveryResult({ deliveryId, ok: true, messageId: result.messageId });
-  logger.info({ jobId: job.id, deliveryId, to, messageId: result.messageId }, 'email-worker: email accepted by SMTP');
-  return { ok: true, messageId: result.messageId };
+  return runEmailJob(job.data, { jobId: job.id });
 }
 
 export function startEmailWorker() {
   if (worker) return worker;
+  if (!shouldRunBullWorkers()) {
+    logger.info('email-worker: skipped (inline queue mode or Redis unavailable)');
+    return null;
+  }
+
+  const concurrency = Math.max(1, Math.min(config.email.workerConcurrency, 5));
 
   worker = new Worker<EmailJobData>('email-job', processEmailJob, {
     connection: redis,
-    concurrency: 5,
+    concurrency,
+    ...bullWorkerPollOptions(),
   });
 
   worker.on('completed', (job) => {
@@ -50,7 +39,7 @@ export function startEmailWorker() {
     logger.error({ err }, 'email-worker: worker error');
   });
 
-  logger.info('✅ BullMQ email-job worker started (concurrency=5)');
+  logger.info({ concurrency }, '✅ BullMQ email-job worker started');
   return worker;
 }
 

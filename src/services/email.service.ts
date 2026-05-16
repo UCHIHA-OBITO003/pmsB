@@ -4,6 +4,10 @@ import { logger } from '../utils/logger';
 
 let transporter: nodemailer.Transporter | null | undefined;
 
+function resetTransporter() {
+  transporter = undefined;
+}
+
 /** True when transactional mail can be attempted (SMTP credentials present). */
 export function smtpCredentialsPresent(): boolean {
   return !!(config.email.user?.trim() && config.email.pass?.trim());
@@ -51,6 +55,9 @@ function getTransporter(): nodemailer.Transporter | null {
   }
 
   transporter = nodemailer.createTransport({
+    pool: true,
+    maxConnections: config.email.poolMaxConnections,
+    maxMessages: 100,
     host: config.email.host,
     port: config.email.port,
     secure: config.email.port === 465,
@@ -73,6 +80,7 @@ function getTransporter(): nodemailer.Transporter | null {
       smtpPort: config.email.port,
       forceIpv4: config.email.forceIpv4,
       connectionTimeoutMs: config.email.connectionTimeoutMs,
+      poolMaxConnections: config.email.poolMaxConnections,
     },
     'SMTP transporter created',
   );
@@ -100,6 +108,9 @@ export async function sendHtmlEmail(to: string, subject: string, html: string, t
     return { ok: true, messageId };
   } catch (err) {
     const detail = smtpFailureDetail(err);
+    if (/ETIMEDOUT|ECONNRESET|ECONNREFUSED/i.test(detail)) {
+      resetTransporter();
+    }
     logger.error({ err, to, subject, from: config.email.from, detail }, 'SMTP rejected or failed send');
     return { ok: false, reason: 'smtp_error', detail };
   }

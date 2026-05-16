@@ -24,6 +24,18 @@ type QueueEmailInput = {
 
 const DEDUPE_WINDOW_MS = 5 * 60 * 1000;
 
+function deliveryMetadata(input: QueueEmailInput): Prisma.InputJsonValue {
+  const base =
+    typeof input.metadata === 'object' && input.metadata !== null && !Array.isArray(input.metadata)
+      ? { ...(input.metadata as Record<string, unknown>) }
+      : {};
+  return {
+    ...base,
+    html: input.template.html,
+    text: input.template.text,
+  } as Prisma.InputJsonValue;
+}
+
 async function createDeliveryRow(input: QueueEmailInput, status: EmailDeliveryStatus, errorDetail?: string) {
   return prisma.emailDelivery.create({
     data: {
@@ -37,7 +49,7 @@ async function createDeliveryRow(input: QueueEmailInput, status: EmailDeliverySt
       fingerprint: input.fingerprint,
       resourceType: input.resourceType,
       resourceId: input.resourceId,
-      metadata: input.metadata,
+      metadata: deliveryMetadata(input),
       ...(status === 'SKIPPED' ? { failedAt: new Date() } : {}),
     },
     select: { id: true },

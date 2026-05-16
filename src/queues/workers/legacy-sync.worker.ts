@@ -1,8 +1,9 @@
 import { Worker, Job } from 'bullmq';
 import { redis } from '../../utils/redis';
 import { logger } from '../../utils/logger';
-import type { LegacySyncJobData } from '../index';
+import type { LegacySyncJobData } from '../job-types';
 import { performLegacyCodemagenSync } from '../../services/legacy-sync.service';
+import { bullWorkerPollOptions, shouldRunBullWorkers } from '../queue-runtime';
 
 let worker: Worker<LegacySyncJobData> | null = null;
 
@@ -14,10 +15,15 @@ async function processLegacySync(job: Job<LegacySyncJobData>) {
 
 export function startLegacySyncWorker() {
   if (worker) return worker;
+  if (!shouldRunBullWorkers()) {
+    logger.info('legacy-sync-worker: skipped (inline queue mode or Redis unavailable)');
+    return null;
+  }
 
   worker = new Worker<LegacySyncJobData>('legacy-sync-job', processLegacySync, {
     connection: redis,
     concurrency: 2,
+    ...bullWorkerPollOptions(),
   });
 
   worker.on('completed', (job) => {
